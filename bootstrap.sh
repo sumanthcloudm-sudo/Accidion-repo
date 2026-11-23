@@ -106,32 +106,45 @@ done
 
 api="https://api.github.com/repos/$repo"
 curl_args=(--silent --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180)
-token=
-if ! $public; then
-  token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
-  if [[ -z $token ]] && command -v gh >/dev/null; then
-    token="$(gh auth token --hostname github.com 2>/dev/null || true)"
-  fi
-  [[ $token =~ ^[A-Za-z0-9_-]+$ ]] || fail "Use an approved GitHub CLI login or provide a read-only GH_TOKEN."
-fi
-unset GH_TOKEN GITHUB_TOKEN
-status="$(curl -q "${curl_args[@]}" --output /dev/null --write-out '%{http_code}' "$api")" ||
-  fail "GitHub is unreachable. Check corporate network or proxy settings."
-if $public; then
-  [[ $status == 200 ]] || fail "Expected an anonymously accessible public repository."
-else
-  [[ $status == 404 ]] || fail "Expected a private repository. Confirm the repository and GitHub access."
-fi
-
 work="$(mktemp -d "$temp_parent/accidion-kit.XXXXXXXX")" || fail "Could not create a private temporary directory."
 trap 'rm -rf -- "$work"' EXIT
 mkdir -- "$work/kit"
-printf 'Accidion bootstrap: %s/%s, retrieving reviewed revision %s\n' "$system" "$arch" "$commit"
+credential_token() {
+  local saved line
+  command -v git >/dev/null || return 1
+  saved="$(
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR
+    printf 'protocol=https\nhost=github.com\npath=%s.git\n\n' "$repo" |
+      GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=Never GIT_ASKPASS=false \
+      GIT_CEILING_DIRECTORIES="${work%/*}" git -C "$work" credential fill 2>/dev/null
+  )" || return 1
+  while IFS= read -r line; do
+    case "$line" in password=*) printf '%s\n' "${line#password=}"; return ;; esac
+  done <<< "$saved"
+  return 1
+}
+token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+if [[ -z $token ]] && command -v gh >/dev/null; then
+  token="$(gh auth token --hostname github.com 2>/dev/null || true)"
+fi
+if [[ -z $token ]]; then token="$(credential_token || true)"; fi
+[[ $token =~ ^[A-Za-z0-9_-]+$ ]] ||
+  fail "Provide an approved GH_TOKEN, GitHub CLI login, or cached Git credential-manager entry."
+unset GH_TOKEN GITHUB_TOKEN
 if $public; then
-  curl -q "${curl_args[@]}" --fail --location --max-redirs 3 --retry 2 \
-    --output "$work/kit.tar.gz" "$api/tarball/$commit" ||
-    fail "Pinned public archive download failed. Check the commit and network policy."
-elif $release_asset; then
+  if ! user_status="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+    curl -q --config - "${curl_args[@]}" --fail --output /dev/null --write-out '%{http_code}' \
+      https://api.github.com/user)" || [[ $user_status != 200 ]]; then
+    fail "GitHub rejected the user credential. Check token validity and approved GitHub access."
+  fi
+else
+  status="$(curl -q "${curl_args[@]}" --output /dev/null --write-out '%{http_code}' "$api")" ||
+    fail "GitHub is unreachable. Check corporate network or proxy settings."
+  [[ $status == 404 ]] || fail "Expected a private repository. Confirm the repository and GitHub access."
+fi
+
+printf 'Accidion bootstrap: %s/%s, retrieving reviewed revision %s\n' "$system" "$arch" "$commit"
+if $release_asset; then
   command -v gh >/dev/null || fail "An approved GitHub CLI installation is required for release asset retrieval."
   GH_TOKEN="$token" gh release download "kit-$commit" --repo "$repo" --pattern 'accidion-kit.tar.gz' \
     --output - </dev/null > "$work/kit.tar.gz" 2>/dev/null ||

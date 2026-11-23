@@ -4,14 +4,15 @@ Run the kit from an existing Java project. The bootstrap downloads the approved 
 
 ## Run from the public GitHub repository
 
-From your Java application's directory, open Git Bash on Windows or Bash on macOS or Linux. The public workflow needs Bash 3.2 or later, curl 7.83.1 or later, tar with gzip, sha256sum or shasum, HTTPS access to GitHub, and a writable temporary directory outside your project. It retrieves the kit anonymously and can install Git and the other supported prerequisites after download. Paste the following as one Bash command, substituting the three values from the reviewed release handoff. Append --dry-run to the final line for a preview without installations or scans.
+From your Java application's directory, open Git Bash on Windows or Bash on macOS or Linux. The workflow needs Bash 3.2 or later, curl 7.83.1 or later, tar with gzip, sha256sum or shasum, HTTPS access to GitHub, and a writable temporary directory outside your project. Authenticate with an approved GitHub user token before running the command. Supply GH_TOKEN through your credential vault, sign in using gh auth login --hostname github.com, or use a previously configured secure Git credential manager with a cached github.com login. Git is required at this stage only for the credential-helper option. Paste the complete Bash command with the three values from the reviewed release handoff. Append --dry-run to preview discovery without installations or scans.
+
+Use a read-only GitHub user token accepted by GitHub's authenticated-user endpoint, with the minimum repository access required by your organization. Complete any required SSO authorization. Keep tokens out of shell history, scripts, Git remote URLs, reports, and chat. The launcher reads cached credentials without prompting, sends the authorization header through standard input, and removes GitHub token variables before running scanners. Configure an OS-backed credential manager, such as Git Credential Manager, through your approved onboarding process. [GitHub user-token requirements](https://docs.github.com/en/rest/users/users#get-the-authenticated-user) · [Git credential helpers](https://git-scm.com/docs/gitcredentials)
 
 ~~~bash
 bash -c '
 set +x
 set -euo pipefail
 umask 077
-unset GH_TOKEN GITHUB_TOKEN
 rev=$1 bootstrap_sha=$2 archive_sha=$3
 shift 3
 [[ $rev =~ ^[a-f0-9]{40}$ && $bootstrap_sha =~ ^[a-f0-9]{64}$ && $archive_sha =~ ^[a-f0-9]{64}$ ]] ||
@@ -26,17 +27,45 @@ done
 [[ -n $parent ]] || { echo "No writable temporary directory outside the application." >&2; exit 2; }
 work="$(mktemp -d "$parent/accidion-public.XXXXXXXX")"
 trap "rm -rf -- \"\$work\"" EXIT
-curl -q --fail --silent --show-error --proto "=https" --connect-timeout 15 --max-time 60 \
-  "https://raw.githubusercontent.com/sumanthcloudm-sudo/Accidion-repo/$rev/bootstrap.sh" \
-  --output "$work/bootstrap.sh"
+repo=sumanthcloudm-sudo/Accidion-repo
+credential_token() {
+  local saved line
+  command -v git >/dev/null || return 1
+  saved="$(
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR
+    printf "protocol=https\nhost=github.com\npath=%s.git\n\n" "$repo" |
+      GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=Never GIT_ASKPASS=false \
+      GIT_CEILING_DIRECTORIES="${work%/*}" git -C "$work" credential fill 2>/dev/null
+  )" || return 1
+  while IFS= read -r line; do
+    case "$line" in password=*) printf "%s\n" "${line#password=}"; return ;; esac
+  done <<< "$saved"
+  return 1
+}
+token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+if [[ -z $token ]] && command -v gh >/dev/null; then
+  token="$(gh auth token --hostname github.com 2>/dev/null || true)"
+fi
+if [[ -z $token ]]; then token="$(credential_token || true)"; fi
+[[ $token =~ ^[A-Za-z0-9_-]+$ ]] ||
+  { echo "Provide an approved GH_TOKEN, GitHub CLI login, or cached Git credential-manager entry." >&2; exit 2; }
+unset GH_TOKEN GITHUB_TOKEN
+if ! printf "header = \"Authorization: Bearer %s\"\n" "$token" |
+  curl -q --config - --fail --silent --proto "=https" --connect-timeout 15 --max-time 60 \
+    -H "Accept: application/vnd.github.raw+json" \
+    "https://api.github.com/repos/$repo/contents/bootstrap.sh?ref=$rev" \
+    --output "$work/bootstrap.sh"; then
+  echo "Authenticated launcher download failed. Check the credential, access, SSO and revision." >&2
+  exit 2
+fi
 if command -v sha256sum >/dev/null; then digest="$(sha256sum < "$work/bootstrap.sh")"
 else digest="$(shasum -a 256 < "$work/bootstrap.sh")"; fi
 [[ ${digest%% *} == "$bootstrap_sha" ]] || { echo "Bootstrap SHA-256 mismatch." >&2; exit 2; }
-"$BASH" "$work/bootstrap.sh" --public --commit "$rev" --archive-sha256 "$archive_sha" -- "$@"
+GH_TOKEN="$token" "$BASH" "$work/bootstrap.sh" --public --commit "$rev" --archive-sha256 "$archive_sha" -- "$@"
 ' accidion-public FULL_COMMIT_SHA BOOTSTRAP_SHA256 KIT_ARCHIVE_SHA256
 ~~~
 
-The release handoff contains the full reviewed public commit SHA, the SHA-256 of bootstrap.sh at that commit, and the SHA-256 of the exact anonymous response from https://api.github.com/repos/sumanthcloudm-sudo/Accidion-repo/tarball/FULL_COMMIT_SHA, following its HTTPS redirect. Distribute these through a trusted channel after review. If the archive digest changes, the workflow stops before extraction. Reverify the upstream bytes and update the handoff before retrying. The public workflow does not use a private release asset.
+The release handoff contains the full reviewed commit SHA, the SHA-256 of the launcher downloaded through the authenticated Contents API, and the SHA-256 of the exact authenticated tarball response, following its HTTPS redirect. Distribute these through a trusted channel after review. A digest mismatch stops execution or extraction. The launcher requires authentication for this workflow. Repository-level access restrictions require a private GitHub repository.
 
 The kit creates fresh JSON reports under $HOME/.accidion/reports/<application-name>/scan-<UTC-date-time>-<id>/. The scan uses your application's files and dependencies. Successful applicable stages produce their individual outputs, with the Syft inventory kept separate. The summary captures scan counts, issue names, severity, paths and line ranges where available, descriptions, impact, remediation, and failure or skip reasons. Use --report-dir for a different parent outside the application.
 
@@ -294,7 +323,7 @@ A completed run exits with 0 when required operations succeeded, 1 for recorded 
 | Bootstrap expects a private repository | Confirm the GitHub slug and its visibility. Use an approved private destination. |
 | Pinned download fails | Check authenticated read access, SSO, the reviewed commit, and network access to GitHub's API and archive service. |
 | Bootstrap or archive SHA-256 mismatch | Get the approved release pins and digests from your administrator. Execution stops before the affected download is run or extracted. |
-| Anonymous download is rate-limited | Wait for GitHub's anonymous rate limit to reset, or contact your administrator for an approved distribution method. |
+| Credential missing or rejected | Check vault injection, GitHub CLI sign-in, or the cached Git credential-manager entry for github.com. Verify token expiration, repository access, and required SSO authorization. |
 | Native and summary counts differ | Check the scanner's nativeFindingCount, findingCount, status, and reason in security-summary.json. The individual report retains the evidence for inspection. |
 | Tool missing or blocked by endpoint protection | Review the installation reason and private log. Ask IT for an approved compatible installation and retry with --no-install. |
 | Python venv or pip cannot install a scanner | Check the Python version, package-index policy and compatible wheel availability. On Linux, ask IT to provision Python's venv support if necessary. |

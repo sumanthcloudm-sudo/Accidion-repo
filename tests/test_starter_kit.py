@@ -445,14 +445,12 @@ class BootstrapTests(unittest.TestCase):
         self.mock_script(mock / "curl",
             '#!/usr/bin/env bash\nset -eu\n'
             'if [[ " $* " == *" --version "* ]]; then printf "curl %s\\n" "$MOCK_CURL_VERSION"; exit; fi\n'
-            'if [[ " $* " == *" -w "* || " $* " == *" --write-out "* ]]; then printf "%s" "$MOCK_HTTP_CODE"; exit; fi\n'
-            '[[ " $* " != *"$MOCK_TOKEN"* && -z "${GH_TOKEN+x}${GITHUB_TOKEN+x}" ]]\n'
-            'if [[ " $* " == *" --config "* ]]; then\n'
-            '  [[ $MOCK_HTTP_CODE == 404 ]]\n'
-            '  read -r auth\n  [[ $auth == "header = \\"Authorization: Bearer $MOCK_TOKEN\\"" ]]\n'
-            'else [[ $MOCK_HTTP_CODE == 200 ]]; fi\n'
+            'if [[ " $* " != *" --config "* && ( " $* " == *" -w "* || " $* " == *" --write-out "* ) ]]; then printf "%s" "$MOCK_HTTP_CODE"; exit; fi\n'
+            '[[ " $* " != *"$MOCK_TOKEN"* && -z "${GH_TOKEN+x}${GITHUB_TOKEN+x}" ]] || { echo "credential exposed to curl" >&2; exit 10; }\n'
+            '[[ " $* " == *" --config - "* ]] || { echo "missing stdin config" >&2; exit 10; }\n'
+            'read -r auth\n[[ $auth == "header = \\"Authorization: Bearer $MOCK_TOKEN\\"" ]] || { echo "unexpected bearer" >&2; exit 10; }\n'
             'case " $* " in\n'
-            '  *"raw.githubusercontent.com/sumanthcloudm-sudo/Accidion-repo/$MOCK_PIN/bootstrap.sh "*) input=$MOCK_BOOTSTRAP ;;\n'
+            '  *"https://api.github.com/user "*) [[ ${MOCK_USER_DENIED:-0} == 0 ]]; printf 200; exit ;;\n'
             '  *"/contents/bootstrap.sh?ref=$MOCK_PIN "*) input=$MOCK_BOOTSTRAP ;;\n'
             '  *"/tarball/$MOCK_PIN "*) [[ ${MOCK_ARCHIVE_FAIL:-0} == 0 ]] || exit 22; input=$MOCK_ARCHIVE ;;\n'
             '  *) exit 11 ;;\nesac\n'
@@ -471,6 +469,13 @@ class BootstrapTests(unittest.TestCase):
             '  *) exit 12 ;;\nesac\n')
         self.mock_script(mock / "git",
             '#!/usr/bin/env bash\nset -eu\n'
+            'if [[ $1 == -C && $3 == credential && $4 == fill ]]; then\n'
+            '  [[ ${MOCK_CREDENTIAL_LOGIN:-0} == 1 && $GIT_TERMINAL_PROMPT == 0 && $GCM_INTERACTIVE == Never ]]\n'
+            '  [[ $GIT_CEILING_DIRECTORIES == "${2%/*}" && ! "$2" -ef "$MOCK_KIT" ]]\n'
+            '  read -r protocol; read -r host; read -r path\n'
+            '  [[ $protocol == protocol=https && $host == host=github.com && $path == path=*.git ]]\n'
+            '  printf "username=fixture\\npassword=%s\\n" "$MOCK_TOKEN"; exit\n'
+            'fi\n'
             '[[ $1 == -C && $2 -ef "$MOCK_KIT" ]] || exit 3\n'
             'case "$3" in rev-parse) printf "%s\\n" "$MOCK_KIT" ;;\n'
             '    remote) printf "%s\\n" "$MOCK_ORIGIN" ;; *) exit 4 ;; esac\n')
@@ -478,7 +483,7 @@ class BootstrapTests(unittest.TestCase):
                     "MOCK_PIN": self.pin, "MOCK_HTTP_CODE": "404", "MOCK_CURL_VERSION": "8.12.0",
                     "MOCK_OS": "MINGW64_NT", "MOCK_ARCH": "x86_64", "MOCK_BIN": self.posix(mock),
                     "MOCK_ARCHIVE": self.posix(archive), "MOCK_BOOTSTRAP": self.posix(self.bootstrap),
-                    "TMPDIR": self.posix(self.app), "MOCK_KIT": self.posix(kit.KIT),
+                    "TMPDIR": self.posix(self.root), "MOCK_KIT": self.posix(kit.KIT),
                     "MOCK_ORIGIN": f"git@github.com:{self.repo}.git", "MOCK_REPO": self.repo}
         guide = (kit.KIT / "README.md").read_text(encoding="utf-8")
         block = next(part for part in guide.split("~~~bash\n") if part.startswith("bash -s -- OWNER/PRIVATE_REPO"))
@@ -578,7 +583,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("Archive SHA-256 mismatch", result.stderr)
 
-    def test_public_bootstrap_downloads_without_credentials_and_rejects_tampering(self):
+    def test_public_bootstrap_authenticates_downloads_and_rejects_tampering(self):
         result = self.shell(self.public_command, MOCK_HTTP_CODE="200")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"scanner:{self.pin}:{self.archive_sha}", result.stdout)
@@ -589,6 +594,19 @@ class BootstrapTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(reason, result.stderr)
                 self.assertNotIn("scanner:", result.stdout)
+
+    def test_public_bootstrap_uses_cached_credentials_and_fails_closed(self):
+        result = self.shell(self.public_command, GH_TOKEN="", MOCK_CREDENTIAL_LOGIN="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"scanner:{self.pin}:{self.archive_sha}", result.stdout)
+        result = self.shell(self.public_command, GH_TOKEN="")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("cached Git credential-manager entry", result.stderr)
+        self.assertNotIn("scanner:", result.stdout)
+        result = self.shell(self.public_command, MOCK_USER_DENIED="1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("GitHub rejected the user credential", result.stderr)
+        self.assertNotIn("scanner:", result.stdout)
 
 
 if __name__ == "__main__":
