@@ -433,7 +433,8 @@ class BootstrapTests(unittest.TestCase):
             '[[ $1 == --dry-run && $2 == --project-path && $3 -ef . && -f App.java ]]\n'
             '[[ -z "${GH_TOKEN+x}${GITHUB_TOKEN+x}" && -f "$(dirname "$0")/kit-marker" ]]\n'
             'case "$0" in "$3/"*) exit 9 ;; esac\n'
-            'printf "scanner:%s:%s\\n" "$ACCIDION_KIT_COMMIT" "$ACCIDION_KIT_ARCHIVE_SHA256"\n',
+            'printf "scanner:%s:%s\\n" "$ACCIDION_KIT_COMMIT" "$ACCIDION_KIT_ARCHIVE_SHA256"\n'
+            'exit "${MOCK_SCANNER_STATUS:-0}"\n',
             newline="\n",
         )
         (fixture / "kit-marker").touch()
@@ -514,7 +515,7 @@ class BootstrapTests(unittest.TestCase):
         path.chmod(0o700)
 
     def shell(self, command, **environment):
-        prefix = 'export PATH="$MOCK_BIN:$PATH"\n'
+        prefix = 'export MOCK_REAL_RM="$(command -v rm)"\nexport PATH="$MOCK_BIN:$PATH"\n'
         result = subprocess.run([self.bash, "-c", prefix + command], cwd=self.app,
                                 env={**self.env, **environment}, timeout=30, text=True, capture_output=True)
         self.assertNotIn(self.token, result.stderr + result.stdout)
@@ -607,6 +608,32 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("GitHub rejected the user credential", result.stderr)
         self.assertNotIn("scanner:", result.stdout)
+
+    def test_public_cleanup_retries_and_preserves_scanner_exit_status(self):
+        self.mock_script(self.root / "bin/sleep", "#!/usr/bin/env bash\nexit 0\n")
+        self.mock_script(self.root / "bin/rm",
+            '#!/usr/bin/env bash\nset -eu\n'
+            'target=${@: -1}\n'
+            'case "$target" in */accidion-kit.*|*/accidion-public.*)\n'
+            '  marker="$MOCK_STATE/${target##*/}"; count=0\n'
+            '  if [[ -f $marker ]]; then read -r count < "$marker"; fi\n'
+            '  count=$((count+1)); printf "%s\\n" "$count" > "$marker"\n'
+            '  if [[ $MOCK_CLEANUP == blocked || $count -le 2 ]]; then exit 1; fi ;;\n'
+            'esac\nexec "$MOCK_REAL_RM" "$@"\n')
+        for mode, scanner_status, attempts in (("transient", 0, "3"), ("blocked", 0, "5"),
+                                                ("blocked", 1, "5"), ("transient", 7, "3")):
+            with self.subTest(mode=mode, scanner_status=scanner_status):
+                state = self.root / f"{mode}-{scanner_status}"
+                state.mkdir()
+                result = self.shell(self.public_command, MOCK_STATE=self.posix(state),
+                                    MOCK_CLEANUP=mode, MOCK_SCANNER_STATUS=str(scanner_status))
+                self.assertEqual(result.returncode, scanner_status, result.stderr)
+                self.assertIn("scanner:", result.stdout)
+                self.assertEqual(sorted(path.name.split(".")[0] for path in state.iterdir()),
+                                 ["accidion-kit", "accidion-public"])
+                self.assertTrue(all(path.read_text().strip() == attempts for path in state.iterdir()))
+                self.assertEqual(result.stderr.count("Warning: could not remove temporary Accidion files"),
+                                 2 if mode == "blocked" else 0)
 
 
 if __name__ == "__main__":

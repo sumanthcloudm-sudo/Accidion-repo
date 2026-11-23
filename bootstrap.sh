@@ -107,7 +107,19 @@ done
 api="https://api.github.com/repos/$repo"
 curl_args=(--silent --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180)
 work="$(mktemp -d "$temp_parent/accidion-kit.XXXXXXXX")" || fail "Could not create a private temporary directory."
-trap 'rm -rf -- "$work"' EXIT
+cleanup_download() {
+  local status=$? attempt
+  trap - EXIT
+  for attempt in 1 2 3 4 5; do
+    if rm -rf -- "$work" 2>/dev/null; then
+      exit "$status"
+    fi
+    if [[ $attempt != 5 ]]; then sleep 1 || break; fi
+  done
+  printf "Warning: could not remove temporary Accidion files at %s (launcher exit %s).\n" "$work" "$status" >&2
+  exit "$status"
+}
+trap cleanup_download EXIT
 mkdir -- "$work/kit"
 credential_token() {
   local saved line

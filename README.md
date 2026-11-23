@@ -26,7 +26,19 @@ for candidate in "${TMPDIR:-/tmp}" /tmp "${HOME:-/tmp}"; do
 done
 [[ -n $parent ]] || { echo "No writable temporary directory outside the application." >&2; exit 2; }
 work="$(mktemp -d "$parent/accidion-public.XXXXXXXX")"
-trap "rm -rf -- \"\$work\"" EXIT
+cleanup_download() {
+  local status=$? attempt
+  trap - EXIT
+  for attempt in 1 2 3 4 5; do
+    if rm -rf -- "$work" 2>/dev/null; then
+      exit "$status"
+    fi
+    if [[ $attempt != 5 ]]; then sleep 1 || break; fi
+  done
+  printf "Warning: could not remove temporary Accidion files at %s (launcher exit %s).\n" "$work" "$status" >&2
+  exit "$status"
+}
+trap cleanup_download EXIT
 repo=sumanthcloudm-sudo/Accidion-repo
 credential_token() {
   local saved line
