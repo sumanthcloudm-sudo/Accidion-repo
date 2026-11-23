@@ -1,0 +1,73 @@
+rules:
+  - id: java-sql-injection
+    languages: [java]
+    severity: ERROR
+    message: SQL injection risk due to unsafe query concatenation
+    metadata:
+      issue_name: Potential SQL Injection from Query Concatenation
+      vulnerability_class: SQL Injection
+      cwe: CWE-89
+      root_cause: The rule detected a string constructed by concatenating an input expression.
+      security_impact: If input is attacker-controlled and reaches a SQL execution sink, it can change the query.
+      recommended_remediation: Use a parameterized query with bound values and verify that the string reaches a database sink.
+    pattern: |
+      String $QUERY = "..." + $INPUT;
+
+  - id: insecure-dynamic-sql
+    languages: [generic]
+    severity: ERROR
+    message: Unsafe dynamic SQL execution
+    metadata:
+      issue_name: Dynamic SQL Execution
+      vulnerability_class: SQL Injection
+      cwe: CWE-89
+      root_cause: The rule detected execution of a SQL statement stored in a variable.
+      security_impact: Untrusted values concatenated into that statement can change the executed query.
+      recommended_remediation: Use a static query or pass data as bound parameters to sp_executesql.
+    pattern-regex: '(?i)EXEC\s*\(\s*@\w+\s*\)'
+    paths:
+      include:
+        - "*.sql"
+
+  - id: vulnerable-log4j
+    languages: [generic]
+    severity: ERROR
+    message: Vulnerable Log4j 2.14.1 - CVE-2021-44228
+    metadata:
+      issue_name: Vulnerable Log4j Dependency
+      affected_dependency: org.apache.logging.log4j:log4j-core
+      installed_version: "2.14.1"
+      cve: CVE-2021-44228
+      recommended_remediation: Upgrade Log4j to a vendor-supported patched release and verify the resolved dependency.
+    pattern-regex: '(?s)<artifactId>log4j-core</artifactId>\s*<version>2\.14\.1</version>'
+    paths:
+      include:
+        - "pom.xml"
+
+  - id: vulnerable-jackson
+    languages: [generic]
+    severity: ERROR
+    message: Vulnerable Jackson Databind 2.9.8
+    metadata:
+      issue_name: Vulnerable Jackson Databind Dependency
+      affected_dependency: com.fasterxml.jackson.core:jackson-databind
+      installed_version: "2.9.8"
+      recommended_remediation: Upgrade Jackson Databind to a vendor-supported patched release and verify the resolved dependency.
+    pattern-regex: '(?s)<artifactId>jackson-databind</artifactId>\s*<version>2\.9\.8</version>'
+    paths:
+      include:
+        - "pom.xml"
+
+  - id: vulnerable-commons-collections
+    languages: [generic]
+    severity: ERROR
+    message: Vulnerable Commons Collections 3.2.1
+    metadata:
+      issue_name: Vulnerable Commons Collections Dependency
+      affected_dependency: commons-collections:commons-collections
+      installed_version: "3.2.1"
+      recommended_remediation: Upgrade Commons Collections to a vendor-supported patched release and verify the resolved dependency.
+    pattern-regex: '(?s)<artifactId>commons-collections</artifactId>\s*<version>3\.2\.1</version>'
+    paths:
+      include:
+        - "pom.xml"

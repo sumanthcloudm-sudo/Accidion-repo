@@ -1,0 +1,12 @@
+framework:
+  - terraform
+  - dockerfile
+  - kubernetes
+  - cloudformation
+  - arm
+  - bicep
+
+output:
+  - json
+
+soft-fail: true

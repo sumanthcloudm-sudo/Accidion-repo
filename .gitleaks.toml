@@ -1,0 +1,18 @@
+title = "Accidion Gitleaks Security Rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "hardcoded-password"
+description = "Hardcoded password detected"
+regex = '''(?im)\bpassword\s*=\s*["']?([a-zA-Z0-9_@!#$%.-]+)(?:["']|[ \t]*(?:$|[;#]))'''
+secretGroup = 1
+tags = ["password", "credentials"]
+
+[[rules]]
+id = "hardcoded-token"
+description = "Hardcoded token detected"
+regex = '''(?im)\btoken\s*=\s*["']?([a-zA-Z0-9_@!#$%.-]+)(?:["']|[ \t]*(?:$|[;#]))'''
+secretGroup = 1
+tags = ["token", "credentials"]

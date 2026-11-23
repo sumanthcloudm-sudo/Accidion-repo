@@ -1,0 +1,24 @@
+// Resolve runtime and compile artifacts without editing the application's build files.
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    root.tasks.register("accidionCollectDependencies") {
+        doLast {
+            def destination = new File(root.property("accidionDependencyDirectory").toString())
+            root.allprojects.eachWithIndex { project, index ->
+                def configurations = project.configurations.findAll {
+                    it.canBeResolved && it.name in ["runtimeClasspath", "compileClasspath"]
+                }
+                configurations.each { configuration ->
+                    configuration.files.eachWithIndex { artifact, artifactIndex ->
+                        if (artifact.isFile()) {
+                            project.copy {
+                                from artifact
+                                into new File(destination, "$index/${configuration.name}/$artifactIndex")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

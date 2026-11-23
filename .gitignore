@@ -1,0 +1,41 @@
+# Local credentials and environment settings
+.env
+.env.*
+!.env.example
+!.env.sample
+.aws/
+.ssh/
+.netrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+/src/config/dev-config.conf
+/src/config/prod-config.conf
+
+# Generated security reports, image archives, and tool logs
+/reports/
+/*.tar
+/accidion-kit.tar.gz
+/.github/modernize/java-upgrade/hooks/*.json
+
+# Build products, virtual environments, and local caches
+target/
+build/
+.gradle/
+.venv/
+venv/
+.virtualenv/
+.virtualenvs/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
