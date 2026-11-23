@@ -22,6 +22,7 @@ REPORTS = {
     "dependency-check": "dependency-check-report.json", "syft": "syft-sbom.json",
     "grype": "grype-report.json", "checkov": "checkov-report.json",
 }
+GENERATED_JSON = (*REPORTS.values(), "grype-sbom-report.json", "security-summary.json")
 IGNORED = {".git", ".gradle", ".venv", "venv", "node_modules", ".terraform",
            ".cache", "__pycache__", ".pytest_cache", "reports"}
 INFRA = (".tf", ".tf.json", ".bicep")
@@ -39,7 +40,7 @@ def infrastructure_file(path):
 
 
 def discover(project):
-    files = {kind: [] for kind in ("java", "maven", "gradle", "jars", "dockerfiles", "iac")}
+    files = {kind: [] for kind in ("java", "maven", "gradle", "jars", "dockerfiles", "iac", "opentofu")}
 
     def raise_walk_error(error):
         raise error
@@ -66,6 +67,8 @@ def discover(project):
                 files["gradle"].append(path)
             elif lower == "dockerfile" or lower.startswith("dockerfile.") or lower.endswith(".dockerfile"):
                 files["dockerfiles"].append(path)
+            elif lower.endswith((".tofu", ".tofu.json")):
+                files["opentofu"].append(path)
             elif infrastructure_file(path):
                 files["iac"].append(path)
     return files
@@ -124,22 +127,46 @@ def write_json(path, content):
     temporary.replace(path)
 
 
+def report_application_directory(name):
+    label = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-_").lower()[:80].rstrip("-_")
+    if re.fullmatch(r"con|prn|aux|nul|com[0-9]|lpt[0-9]", label):
+        label = f"app-{label}"
+    return label or "application"
+
+
 def private_run_path(parent):
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = Path(tempfile.mkdtemp(prefix=f"scan-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-", dir=parent))
     if os.name == "nt":
         try:
-            identity = run(["whoami", "/user", "/fo", "csv", "/nh"], capture=True, timeout=30)
+            system = Path(os.environ["SystemRoot"]) / "System32"
+            identity = run([system / "whoami.exe", "/user", "/fo", "csv", "/nh"], capture=True, timeout=30)
             sid = next(csv.reader(identity.splitlines()))[-1]
             if not sid.startswith("S-1-"):
                 raise RuntimeError("Could not confirm the current Windows account SID")
-            run(["icacls", path, "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"], capture=True, timeout=30)
+            run([system / "icacls.exe", path, "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
+                capture=True, timeout=30)
         except Exception:
             path.rmdir()
             raise
     else:
         path.chmod(0o700)
     return path
+
+
+def native_finding_count(name, report):
+    if name == "gitleaks":
+        return len(report or [])
+    if name == "semgrep":
+        return len(report["results"])
+    if name == "dependency-check":
+        return sum(len(item.get("vulnerabilities") or []) for item in report["dependencies"])
+    if name == "grype":
+        return len(report["matches"])
+    if name == "checkov":
+        return sum(len(scan["results"].get("failed_checks") or [])
+                   for scan in (report if isinstance(report, list) else [report]))
+    return 0  # Syft reports inventory.
 
 
 def report_error(name, report):
@@ -211,6 +238,8 @@ def execute(options, system, arch):
         raise ValueError("Project path must be a directory")
     files = discover(project)
     roots = {family: build_roots(files, family) for family in ("maven", "gradle")}
+    app_name = application_name(project, roots)
+    application_directory = report_application_directory(app_name)
     dockerfile = select_dockerfile(files, project)
     image_requested = bool(options.image or (options.build_image and dockerfile))
     java_app = bool(files["java"] or files["jars"] or files["maven"] or files["gradle"])
@@ -221,11 +250,14 @@ def execute(options, system, arch):
         "dependency-check": None if java_needed else "No Maven/Gradle build files or Java archives",
         "syft": None if java_app else "No Java application inputs",
         "grype": None if java_app or options.image or options.build_image else "No Java SBOM or container target",
-        "checkov": None if files["iac"] or files["dockerfiles"] else "No supported infrastructure candidates",
+        "checkov": None if files["iac"] or files["dockerfiles"] else (
+            "OpenTofu files found, but native .tofu/.tofu.json coverage is unavailable"
+            if files["opentofu"] else "No supported infrastructure candidates"),
     }
     discovery = {key: len(items) for key, items in files.items()}
     if options.dry_run:
         print(json.dumps({"platform": system, "architecture": arch, "project": str(project),
+                          "applicationName": app_name, "reportApplicationDirectory": application_directory,
                           "discovery": discovery, "buildRoots": {
                               k: [str(p.relative_to(project)) for p in v] for k, v in roots.items()},
                           "installMissing": not options.no_install,
@@ -234,15 +266,30 @@ def execute(options, system, arch):
 
     home = Path(os.environ.get("ACCIDION_HOME", Path.home() / ".accidion")).resolve()
     report_parent = (options.report_dir or home / "reports").resolve()
-    cache = home / "tools"
-    if report_parent.is_relative_to(project) or cache.is_relative_to(project):
+    application_reports = (report_parent / application_directory).resolve()
+    cache = (home / "tools").resolve()
+    if (report_parent.is_relative_to(project) or cache.is_relative_to(project)
+            or application_reports.is_relative_to(project) or application_reports.parent != report_parent):
         raise ValueError("Report and tool directories must be outside the project being scanned")
-    report_dir = private_run_path(report_parent)
+    report_dir = private_run_path(application_reports)
     started = datetime.now(timezone.utc)
     redactor = Redactor()
     statuses = {}
     issues = []
     issue_ids = Counter()
+    vulnerability_caches = {}
+
+    def vulnerability_cache(scanner, location):
+        path = location.expanduser().resolve()
+        if path.is_relative_to(project):
+            raise ValueError("Vulnerability cache must be outside the scanned project")
+        if scanner not in vulnerability_caches:
+            vulnerability_caches[scanner] = {
+                "path": str(path), "presentBeforeScan": path.is_dir() and any(path.iterdir()),
+            }
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return path
+
     with tempfile.TemporaryFile(mode="w+", dir=report_dir, encoding="utf-8", errors="replace") as log:
         installer = Installer(system, arch, cache, not options.no_install, log)
         installer.records["python"] = {
@@ -283,8 +330,12 @@ def execute(options, system, arch):
             installation = installer.records[name]
             entry = {"status": "skipped", "reason": skip, "report": None,
                      "version": installation.get("version"), "installationStatus": installation["status"],
-                     "findingCount": None, "findings": []}
+                     "findingCount": None, "nativeFindingCount": None, "findings": []}
             statuses[name] = entry
+            if name == "checkov" and files["opentofu"]:
+                entry["unsupportedInputs"] = [
+                    str(path.relative_to(project)) for path in files["opentofu"]
+                ]
             if skip:
                 print(f"{label}: skipped ({skip})", flush=True)
                 return
@@ -316,6 +367,8 @@ def execute(options, system, arch):
                         entry["report"] = str(output)
                     else:
                         entry["additionalReports"].append(str(output))
+                    native_count = native_finding_count(name, report)
+                    entry["nativeFindingCount"] = (entry["nativeFindingCount"] or 0) + native_count
                     if name == "syft":
                         if report.get("bomFormat") != "CycloneDX":
                             raise ValueError("Expected a CycloneDX SBOM")
@@ -343,9 +396,16 @@ def execute(options, system, arch):
                     problems.append(f"Could not interpret {native.name}: {error}")
             if entry["report"] or entry.get("additionalReports"):
                 entry["findingCount"] = len(entry["findings"])
+                if entry["nativeFindingCount"] != entry["findingCount"]:
+                    problems.append(f"Native findings ({entry['nativeFindingCount']}) differ from normalized "
+                                    f"findings ({entry['findingCount']}); inspect the individual report")
             entry.update(status="failed" if problems else "success",
                          reason=redactor.text("; ".join(problems)) if problems else None)
-            print(f"{label}: {entry['status']} | {len(entry['findings'])} issues", flush=True)
+            if name == "syft":
+                inventory = entry.get("inventoryCount", "unavailable")
+                print(f"{label}: {entry['status']} | SBOM components: {inventory}", flush=True)
+            else:
+                print(f"{label}: {entry['status']} | {len(entry['findings'])} issues", flush=True)
             log.flush()
 
         def invoke(cmd, *args, accepted=(0,), env=None):
@@ -375,8 +435,7 @@ def execute(options, system, arch):
                 prepare_dependencies()
                 if resolution_error:
                     raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
-                database = home / "dependency-check-data" if not options.no_install else work / "dependency-check-data"
-                database.mkdir(parents=True, exist_ok=True, mode=0o700)
+                database = vulnerability_cache("dependency-check", home / "dependency-check-data")
                 args = ["--project", project.name, "--format", "JSON", "--out", out.parent,
                         "--data", database, "--scan", deps]
                 for artifact in files["jars"]:
@@ -389,7 +448,8 @@ def execute(options, system, arch):
                 prepare_dependencies()
                 if resolution_error:
                     raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
-                invoke(cmd, "scan", f"dir:{project}", "--exclude", "**/.git/**",
+                excludes = [flag for file in GENERATED_JSON for flag in ("--exclude", f"**/{file}")]
+                invoke(cmd, "scan", f"dir:{project}", "--exclude", "**/.git/**", *excludes,
                        "-o", f"cyclonedx-json={out}")
                 if not builds:
                     return
@@ -417,10 +477,15 @@ def execute(options, system, arch):
                                           for ref, targets in references.items()]
                 write_json(out, report)
 
+            def run_grype(cmd, target, out):
+                database = vulnerability_cache("grype", Path(os.environ.get("GRYPE_DB_CACHE_DIR") or home / "grype-db"))
+                invoke(cmd, target, "-o", "json", "--file", out,
+                       env={**os.environ, "GRYPE_DB_CACHE_DIR": str(database)})
+
             def grype_sbom(cmd, out):
                 if statuses["syft"]["status"] != "success":
                     raise RuntimeError("A successful Syft SBOM is required for package scanning")
-                invoke(cmd, f"sbom:{work / REPORTS['syft']}", "-o", "json", "--file", out)
+                run_grype(cmd, f"sbom:{work / REPORTS['syft']}", out)
 
             def grype_image(cmd, out):
                 if options.build_image and not dockerfile:
@@ -436,7 +501,7 @@ def execute(options, system, arch):
                         invoke(docker, "build", "-f", dockerfile, "-t", image, dockerfile.parent)
                         built = True
                     invoke(docker, "image", "save", "-o", archive, image)
-                    invoke(cmd, f"docker-archive:{archive}", "-o", "json", "--file", out)
+                    run_grype(cmd, f"docker-archive:{archive}", out)
                 finally:
                     if built:
                         invoke(docker, "image", "rm", image)
@@ -476,6 +541,7 @@ def execute(options, system, arch):
                 "--report-format", "json", "--report-path", out, "--redact=0", "--exit-code", "0"), setup)
             execute_scan("semgrep", lambda cmd, out: invoke(
                 cmd, "scan", "--config", KIT / "semgrep.yml", "--metrics=off", "--disable-version-check",
+                *(f"--exclude={filename}" for filename in GENERATED_JSON),
                 "--json", "--output", out, project), setup or applicability["semgrep"])
             execute_scan("dependency-check", dependency_check, setup or applicability["dependency-check"])
             execute_scan("syft", syft, setup or applicability["syft"])
@@ -485,12 +551,13 @@ def execute(options, system, arch):
         log.seek(0)
         (report_dir / "run.log").write_text(redactor.text(log.read()), encoding="utf-8")
 
-    summary = {"schemaVersion": 2, "applicationName": application_name(project, roots), "scanStartedAt": started.isoformat(),
+    summary = {"schemaVersion": 2, "applicationName": app_name, "scanStartedAt": started.isoformat(),
                "generatedAt": datetime.now(timezone.utc).isoformat(), "platform": system, "architecture": arch,
                "kitCommit": os.environ.get("ACCIDION_KIT_COMMIT"),
                "kitArchiveSha256": os.environ.get("ACCIDION_KIT_ARCHIVE_SHA256"),
                "project": str(project), "mode": "setup-only" if options.setup_only else "scan",
                "discovery": discovery, "installations": installer.records, "scanners": statuses,
+               "vulnerabilityCaches": vulnerability_caches,
                "toolVersions": {name: entry.get("version") for name, entry in installer.records.items()},
                "totalFindings": len(issues), "findingsBySeverity": dict(Counter(x["severity"] for x in issues)),
                "findingsByScanner": {name: len(entry["findings"]) for name, entry in statuses.items()},

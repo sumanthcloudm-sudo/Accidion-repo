@@ -17,6 +17,7 @@
 
 # Generated security reports, image archives, and tool logs
 /reports/
+/.accidion/
 /*.tar
 /accidion-kit.tar.gz
 /.github/modernize/java-upgrade/hooks/*.json

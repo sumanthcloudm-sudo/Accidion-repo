@@ -15,6 +15,19 @@ import starter_install
 import starter_kit as kit
 
 
+def host_bash():
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    if git:
+        git_tools = Path(subprocess.check_output([git, "--exec-path"], text=True).strip())
+        if len(git_tools.parents) >= 3:
+            bash = git_tools.parents[2] / "bin/bash.exe"
+            if bash.is_file():
+                return str(bash)
+    return None
+
+
 class StarterKitTests(unittest.TestCase):
     SECRET = "fixture-secret-only-947285"
     def test_platforms_and_assets(self):
@@ -33,12 +46,70 @@ class StarterKitTests(unittest.TestCase):
         self.assertIn("Git.Git", starter_install.package_command("windows", "git", lambda _: True))
         self.assertIn("temurin@21", starter_install.package_command("macos", "java", lambda _: True))
         with patch.object(starter_install.os, "geteuid", create=True, return_value=0):
-            self.assertEqual(starter_install.package_command("linux", "git", lambda _: True)[0], "apt-get")
+            self.assertEqual(starter_install.package_command("linux", "git", lambda _: True, family="debian")[0],
+                             "apt-get")
+            self.assertEqual(starter_install.package_command("linux", "docker", lambda _: True, family="fedora"),
+                             ["dnf", "install", "-y", "moby-engine"])
+            self.assertEqual(starter_install.package_command("linux", "docker", lambda tool: tool == "yum",
+                                                               family="rhel"),
+                             ["yum", "install", "-y", "docker-ce"])
         with patch.object(starter_install.os, "geteuid", create=True, return_value=1000):
             with self.assertRaises(PermissionError):
                 starter_install.package_command("linux", "git", lambda _: True)
         with self.assertRaises(ValueError):
             starter_install.detect("FreeBSD", "amd64")
+
+    def test_linux_distribution_identification(self):
+        for release, family in [
+            ({"ID": "ubuntu", "ID_LIKE": "debian"}, "debian"),
+            ({"ID": "debian"}, "debian"),
+            ({"ID": "fedora"}, "fedora"),
+            ({"ID": "rocky", "ID_LIKE": "rhel centos fedora"}, "rhel"),
+            ({"ID": "rhel", "ID_LIKE": "fedora"}, "rhel"),
+        ]:
+            with self.subTest(release=release), patch.object(
+                starter_install.platform, "freedesktop_os_release", return_value=release
+            ):
+                self.assertEqual(starter_install.linux_family(), family)
+
+    def test_missing_arm_package_is_reported_without_download(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(starter_install, "fetch", return_value=b'{"assets": []}') as fetch:
+            installer = starter_install.Installer("windows", "arm64", Path(directory), True, None)
+            with self.assertRaisesRegex(RuntimeError, r"No upstream gitleaks .* windows/arm64"):
+                installer.install_archive("gitleaks")
+            fetch.assert_called_once()
+
+    def test_native_launcher_and_private_report_directory(self):
+        bash = host_bash()
+        if not bash:
+            if os.environ.get("ACCIDION_EXPECT_SYSTEM"):
+                self.fail("The runner needs Bash, or Git Bash on Windows")
+            self.skipTest("Bash or Git Bash unavailable")
+        system, arch = kit.detect()
+        self.assertEqual(system, os.getenv("ACCIDION_EXPECT_SYSTEM", system))
+        self.assertEqual(arch, os.getenv("ACCIDION_EXPECT_ARCH", arch))
+        if family := os.getenv("ACCIDION_EXPECT_DISTRO"):
+            self.assertEqual(starter_install.linux_family(), family)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "Fresh Java"
+            app.mkdir()
+            (app / "pom.xml").write_text("<project><name>Compatibility App</name></project>")
+            (app / "Main.java").touch()
+            (app / "Dockerfile").write_text("FROM scratch\n")
+            for script in ("bootstrap.sh", "security-scan.sh"):
+                subprocess.run([bash, "-n", str(kit.KIT / script)], check=True, timeout=30)
+            result = subprocess.run([bash, str(kit.KIT / "security-scan.sh"), "--dry-run"],
+                                    cwd=app, text=True, capture_output=True, check=True, timeout=30)
+            plan = json.loads(result.stdout)
+            self.assertEqual((plan["platform"], plan["architecture"]), (system, arch))
+            self.assertEqual(plan["reportApplicationDirectory"], "compatibility-app")
+            self.assertTrue(all(reason is None for reason in plan["scanners"].values()))
+            run_dir = kit.private_run_path(root / "reports" / plan["reportApplicationDirectory"])
+            self.assertRegex(run_dir.name, r"^scan-\d{8}T\d{6}Z-")
+            kit.write_json(run_dir / "fixture.json", {"smoke": True})
+            self.assertEqual(json.loads((run_dir / "fixture.json").read_text()), {"smoke": True})
 
     def test_installer_reuses_or_installs_and_reports_failures(self):
         installer = starter_install.Installer("linux", "amd64", Path("mock"), True, None)
@@ -61,15 +132,46 @@ class StarterKitTests(unittest.TestCase):
 
     @staticmethod
     def populate(project):
-        paths = ["src/Main.java", "pom.xml", "module/pom.xml", "mvnw", "mvnw.cmd",
+        paths = ["src/main/java/example/Main.java", "pom.xml", "module/pom.xml", "mvnw", "mvnw.cmd",
                  "sidecar/build.gradle.kts", "sidecar/gradlew", "sidecar/gradlew.bat",
                  "target/app.jar", "Dockerfile", "deploy/main.tf", ".git/Hidden.java"]
         for name in paths:
             path = project / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
-        (project / "pom.xml").write_text('<project xmlns="http://maven.apache.org/POM/4.0.0">'
-                                             '<name>External Java App</name></project>')
+        (project / "pom.xml").write_text("""<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.4.1</version>
+  </parent>
+  <groupId>example</groupId><artifactId>fixture-app</artifactId><version>1.0.0</version>
+  <name>External Java App</name>
+  <dependencies>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+  </dependencies>
+</project>
+""")
+        (project / "src/main/java/example/Main.java").write_text("""package example;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class Main {
+    public static void main(String[] args) {
+        SpringApplication.run(Main.class, args);
+    }
+
+    String buildFixtureQuery(String input) {
+        String query = "SELECT name FROM demo WHERE name = " + input;
+        return query;
+    }
+}
+""")
+        (project / "fixture.env").write_text("token=FAKE_FIXTURE_VALUE_ONLY\n")
+        (project / "Dockerfile").write_text("FROM eclipse-temurin:21-jre\nWORKDIR /app\nUSER root\nCOPY target/app.jar app.jar\n")
+        (project / "deploy/main.tf").write_text('resource "aws_s3_bucket" "fixture" {\n  bucket = "synthetic-never-deploy"\n}\n')
         (project / "deploy/service.yaml").write_text("apiVersion: v1\nkind: Service\n")
         (project / "settings.json").write_text("{}")
 
@@ -85,16 +187,17 @@ class StarterKitTests(unittest.TestCase):
             out = Path(args[args.index("--report-path") + 1])
             data = [{"RuleID": "generic-api-key", "Description": "Hardcoded API Key",
                      "Secret": StarterKitTests.SECRET, "Match": f'apiKey="{StarterKitTests.SECRET}"',
-                     "File": "src/Main.java", "StartLine": index, "EndLine": index}
+                     "File": "fixture.env", "StartLine": index, "EndLine": index}
                     for index in range(1, 7)]
             print(StarterKitTests.SECRET, file=kwargs["log"])
         elif name == "semgrep":
             out = Path(args[args.index("--output") + 1])
-            data = {"results": [{"check_id": "java-sql-injection", "path": "src/Main.java",
+            data = {"results": [{"check_id": "java-sql-injection", "path": "src/main/java/example/Main.java",
                                  "start": {"line": 12}, "end": {"line": 14},
                                  "extra": {"severity": "ERROR", "message": StarterKitTests.SECRET,
                                            "lines": "Source code", "metadata": {
                                                "issue_name": "SQL Injection", "cwe": "CWE-89",
+                                               "security_impact": "The query can be altered.",
                                                "remediation": "Bind query parameters."}}}], "errors": []}
         elif name == "dependency-check":
             out = Path(args[args.index("--out") + 1]) / kit.REPORTS[name]
@@ -158,7 +261,8 @@ class StarterKitTests(unittest.TestCase):
                                 if call.args[0][0] in kit.REPORTS]
                 self.assertEqual(actual_order, ["gitleaks", "semgrep", "dependency-check",
                                                 "syft", "syft", "grype", "grype", "checkov"])
-                reports = sorted((home / "reports").iterdir())[-1]
+                application_reports = home / "reports/external-java-app"
+                reports = sorted(application_reports.iterdir())[-1]
                 self.assertEqual(set(p.name for p in reports.glob("*.json")),
                                  set(kit.REPORTS.values()) | {"security-summary.json", "grype-sbom-report.json"})
                 summary = json.loads((reports / "security-summary.json").read_text())
@@ -177,10 +281,19 @@ class StarterKitTests(unittest.TestCase):
                 self.assertEqual(len({item["issue_id"] for item in issues}), 11)
                 self.assertEqual(issues[0]["issue_name"], "Hardcoded API Key")
                 self.assertEqual(issues[6]["issue_name"], "SQL Injection")
-                self.assertEqual(issues[6]["source_file"], "src/Main.java")
+                self.assertEqual(issues[6]["source_file"], "src/main/java/example/Main.java")
+                self.assertEqual(issues[6]["affected_filename"], "Main.java")
+                self.assertEqual(issues[6]["relative_file_path"], "src/main/java/example/Main.java")
+                self.assertEqual({key: row["nativeFindingCount"] for key, row in summary["scanners"].items()},
+                                 summary["findingsByScanner"])
                 self.assertEqual((issues[6]["start_line"], issues[6]["end_line"]), (12, 14))
                 self.assertEqual(issues[6]["cwe_id"], ["CWE-89"])
+                self.assertEqual(issues[6]["severity"], "ERROR")
+                self.assertEqual(issues[6]["security_impact"], "The query can be altered.")
+                self.assertEqual(issues[6]["recommended_remediation"], "Bind query parameters.")
                 self.assertEqual(issues[7]["installed_version"], "1.0")
+                self.assertEqual(issues[7]["affected_filename"], "test.jar")
+                self.assertIsNone(issues[7]["relative_file_path"])
                 self.assertIsNone(issues[7]["fixed_version"])
                 self.assertIn("fixed_version", issues[7]["evidence_limitations"])
                 self.assertEqual(issues[8]["fixed_version"], ["2.0"])
@@ -189,12 +302,15 @@ class StarterKitTests(unittest.TestCase):
                 self.assertEqual(issues[10]["source_file"], "Dockerfile")
                 for path in reports.iterdir():
                     self.assertNotIn(self.SECRET, path.read_text(encoding="utf-8"))
+                    if path.suffix == ".json":
+                        self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), (dict, list))
                 self.assertNotIn(self.SECRET, terminal.getvalue())
                 self.assertIn("Issue 11: Container Running as Root", terminal.getvalue())
+                self.assertIn("Syft: success | SBOM components: 1", terminal.getvalue())
                 original = json.loads((reports / "gitleaks-report.json").read_text())
                 self.assertEqual(original[0]["Secret"], "[REDACTED]")
                 self.assertEqual(original[0]["StartLine"], 1)
-                self.assertEqual(len(list((home / "reports").iterdir())), 2)
+                self.assertEqual(len(list(application_reports.iterdir())), 2)
                 wrappers = [wrapper for name, wrapper in calls if name in {"mvn", "gradle"}]
                 self.assertTrue(wrappers)
                 self.assertTrue(all((len(cmd) == 1) == (system == "windows") for cmd in wrappers))
@@ -205,6 +321,50 @@ class StarterKitTests(unittest.TestCase):
         path = parent / str(len(list(parent.iterdir())))
         path.mkdir()
         return path
+
+    def test_vulnerability_caches_persist_across_separate_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "data"
+            project = Path(root) / "app"
+            self.populate(project)
+            cache_marker_seen = {"dependency-check": [], "grype": []}
+
+            def ensure(installer, name, **kwargs):
+                installer.records[name] = {"status": "reused", "version": "123.4"}
+                return [name]
+
+            def mock_run(args, **kwargs):
+                name = args[0]
+                if name in cache_marker_seen:
+                    path = (Path(args[args.index("--data") + 1]) if name == "dependency-check"
+                            else Path(kwargs["env"]["GRYPE_DB_CACHE_DIR"]))
+                    self.assertEqual(path.parent, home)
+                    marker = path / "fake-database"
+                    cache_marker_seen[name].append(marker.is_file())
+                    marker.touch()
+                return self.mock_run(args, **kwargs)
+
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(home), "GRYPE_DB_CACHE_DIR": ""}), \
+                 patch.object(kit.Installer, "ensure", ensure), \
+                 patch.object(kit, "run", side_effect=mock_run), \
+                 patch.object(kit, "refresh_windows_path"), \
+                 patch.object(kit, "private_run_path", side_effect=self.fake_private), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                arguments = ["--project-path", str(project)]
+                self.assertEqual(kit.execute(kit.args_for(arguments), "windows", "amd64"), 0)
+                self.assertEqual(kit.execute(kit.args_for([*arguments, "--no-install"]), "windows", "amd64"), 0)
+            self.assertEqual(cache_marker_seen, {"dependency-check": [False, True], "grype": [False, True]})
+            runs = sorted((home / "reports/external-java-app").iterdir())
+            self.assertEqual(len(runs), 2)
+            for index, run_directory in enumerate(runs):
+                summary = json.loads((run_directory / "security-summary.json").read_text())
+                self.assertEqual({key: info["presentBeforeScan"] for key, info in summary["vulnerabilityCaches"].items()},
+                                 {"dependency-check": bool(index), "grype": bool(index)})
+
+    def test_application_report_directory_is_safe(self):
+        self.assertEqual(kit.report_application_directory("..\\CON"), "app-con")
+        self.assertEqual(kit.report_application_directory("Acme / Orders"), "acme-orders")
+        self.assertEqual(kit.report_application_directory(".."), "application")
 
     def test_failed_scanner_does_not_prevent_other_applicable_scans(self):
         with tempfile.TemporaryDirectory() as root:
@@ -223,18 +383,24 @@ class StarterKitTests(unittest.TestCase):
                     raise RuntimeError("simulated network or permission failure")
                 return self.mock_run(args, **kwargs)
 
+            actual_normalizer = kit.NORMALIZE["gitleaks"]
             with patch.dict(os.environ, {"ACCIDION_HOME": str(home)}), \
+                 patch.dict(kit.NORMALIZE, {"gitleaks": lambda report, folder: actual_normalizer(report[:-1], folder)}), \
                  patch.object(kit.Installer, "ensure", ensure), \
                  patch.object(kit, "run", side_effect=mock_run), \
                  patch.object(kit, "refresh_windows_path"), \
                  patch.object(kit, "private_run_path", side_effect=self.fake_private), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(kit.execute(kit.args_for(["--project-path", str(project)]), "linux", "amd64"), 1)
-            summary = json.loads((home / "reports/0/security-summary.json").read_text())
+            summary = json.loads((home / "reports/app/0/security-summary.json").read_text())
+            self.assertEqual(summary["scanners"]["gitleaks"]["status"], "failed")
+            self.assertEqual(summary["scanners"]["gitleaks"]["nativeFindingCount"], 6)
+            self.assertEqual(summary["scanners"]["gitleaks"]["findingCount"], 5)
+            self.assertIn("differ from normalized findings", summary["scanners"]["gitleaks"]["reason"])
             self.assertEqual(summary["scanners"]["semgrep"]["status"], "failed")
             self.assertEqual(summary["scanners"]["semgrep"]["findingCount"], 1)
             self.assertIn("simulated network or permission failure", summary["scanners"]["semgrep"]["reason"])
-            self.assertTrue((home / "reports/0/semgrep-report.json").exists())
+            self.assertTrue((home / "reports/app/0/semgrep-report.json").exists())
             self.assertEqual(summary["scanners"]["grype"]["status"], "success")
             self.assertEqual(summary["scanners"]["checkov"]["status"], "skipped")
             self.assertEqual(summary["installations"]["checkov"]["status"], "skipped")
@@ -245,8 +411,7 @@ class BootstrapTests(unittest.TestCase):
     token = "test_mock_token"
 
     def setUp(self):
-        self.bash = (Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
-                     if os.name == "nt" else shutil.which("bash"))
+        self.bash = host_bash()
         if not self.bash or not Path(self.bash).is_file():
             self.skipTest("Bash or Git Bash unavailable")
         temporary = tempfile.TemporaryDirectory()
@@ -282,8 +447,12 @@ class BootstrapTests(unittest.TestCase):
             'if [[ " $* " == *" --version "* ]]; then printf "curl %s\\n" "$MOCK_CURL_VERSION"; exit; fi\n'
             'if [[ " $* " == *" -w "* || " $* " == *" --write-out "* ]]; then printf "%s" "$MOCK_HTTP_CODE"; exit; fi\n'
             '[[ " $* " != *"$MOCK_TOKEN"* && -z "${GH_TOKEN+x}${GITHUB_TOKEN+x}" ]]\n'
-            'read -r auth\n[[ $auth == "header = \\"Authorization: Bearer $MOCK_TOKEN\\"" ]]\n'
+            'if [[ " $* " == *" --config "* ]]; then\n'
+            '  [[ $MOCK_HTTP_CODE == 404 ]]\n'
+            '  read -r auth\n  [[ $auth == "header = \\"Authorization: Bearer $MOCK_TOKEN\\"" ]]\n'
+            'else [[ $MOCK_HTTP_CODE == 200 ]]; fi\n'
             'case " $* " in\n'
+            '  *"raw.githubusercontent.com/sumanthcloudm-sudo/Accidion-repo/$MOCK_PIN/bootstrap.sh "*) input=$MOCK_BOOTSTRAP ;;\n'
             '  *"/contents/bootstrap.sh?ref=$MOCK_PIN "*) input=$MOCK_BOOTSTRAP ;;\n'
             '  *"/tarball/$MOCK_PIN "*) [[ ${MOCK_ARCHIVE_FAIL:-0} == 0 ]] || exit 22; input=$MOCK_ARCHIVE ;;\n'
             '  *) exit 11 ;;\nesac\n'
@@ -317,10 +486,17 @@ class BootstrapTests(unittest.TestCase):
         self.command = block.split("\n~~~", 1)[0].replace(
             pins, f"{self.repo} {self.pin} {self.bootstrap_sha} {self.archive_sha} --dry-run", 1
         )
-        release = next(part for part in guide.split("~~~bash\n") if part.startswith("bash -c"))
+        release = next(part for part in guide.split("~~~bash\n")
+                       if part.startswith("bash -c") and "--release-asset" in part.split("\n~~~", 1)[0])
         self.release_command = release.split("\n~~~", 1)[0].replace(
             pins,
             f"{self.repo} {self.pin} {self.bootstrap_sha} {self.archive_sha} --dry-run", 1,
+        )
+        public = next(part for part in guide.split("~~~bash\n")
+                      if part.startswith("bash -c") and "--public --commit" in part.split("\n~~~", 1)[0])
+        self.public_command = public.split("\n~~~", 1)[0].replace(
+            "FULL_COMMIT_SHA BOOTSTRAP_SHA256 KIT_ARCHIVE_SHA256",
+            f"{self.pin} {self.bootstrap_sha} {self.archive_sha} --dry-run", 1,
         )
 
     @staticmethod
@@ -392,7 +568,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("scanner:", result.stdout)
         result = self.shell(command, MOCK_ORIGIN="https://example.invalid/team/other")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("Confirm the private GitHub repository", result.stderr)
+        self.assertIn("Confirm the GitHub repository", result.stderr)
 
     def test_private_release_download_uses_commit_tag_and_validates_asset(self):
         result = self.shell(self.release_command)
@@ -401,6 +577,18 @@ class BootstrapTests(unittest.TestCase):
         result = self.shell(self.release_command.replace(self.archive_sha, "0" * 64))
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("Archive SHA-256 mismatch", result.stderr)
+
+    def test_public_bootstrap_downloads_without_credentials_and_rejects_tampering(self):
+        result = self.shell(self.public_command, MOCK_HTTP_CODE="200")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"scanner:{self.pin}:{self.archive_sha}", result.stdout)
+        for value, reason in ((self.bootstrap_sha, "Bootstrap SHA-256 mismatch"),
+                              (self.archive_sha, "Archive SHA-256 mismatch")):
+            with self.subTest(reason=reason):
+                result = self.shell(self.public_command.replace(value, "0" * 64), MOCK_HTTP_CODE="200")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn("scanner:", result.stdout)
 
 
 if __name__ == "__main__":

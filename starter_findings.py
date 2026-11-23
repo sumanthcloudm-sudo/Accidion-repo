@@ -1,7 +1,7 @@
 """Map scanner evidence to a common issue schema and scrub published output."""
 import hashlib
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, unquote, urlsplit
 
 NAMES = {
@@ -147,16 +147,24 @@ def dependency_evidence(item):
 def new_issue(scanner, **evidence):
     issue = dict.fromkeys((
         "issue_number", "issue_id", "issue_name", "scanner_name", "vulnerability_category", "severity",
-        "source_file", "start_line", "end_line", "issue_description", "root_cause", "security_impact",
+        "source_file", "affected_filename", "relative_file_path",
+        "start_line", "end_line", "issue_description", "root_cause", "security_impact",
         "recommended_remediation", "rule_id", "cwe_id", "cve_id", "affected_dependency",
         "installed_version", "fixed_version", "reference_links",
     ))
     issue.update(scanner_name=NAMES[scanner], **evidence)
+    if source := issue["source_file"]:
+        path = PurePosixPath(source.replace("\\", "/"))
+        issue["affected_filename"] = issue["affected_filename"] or path.name or None
+        if not path.is_absolute() and not PureWindowsPath(source).drive and ".." not in path.parts:
+            issue["relative_file_path"] = path.as_posix()
     issue["severity"] = first_text(issue["severity"]).upper() if first_text(issue["severity"]) else "UNKNOWN"
     missing = {
         "issue_description": "No detailed description was supplied.",
         "rule_id": "The scanner did not supply an identifier for this match.",
         "source_file": "Scanner evidence did not identify a project source file.",
+        "affected_filename": "The scanner did not identify an affected filename.",
+        "relative_file_path": "The scanner did not identify a path relative to the project.",
         "start_line": "Scanner evidence did not supply a start line in the project file.",
         "end_line": "Scanner evidence did not supply an end line in the project file.",
         "root_cause": "The report did not establish a root cause.",
@@ -233,6 +241,7 @@ def dependency_issues(report, project):
             yield new_issue("dependency-check", issue_name=title or f"Vulnerable Java dependency{f' — {label}' if label else ''}",
                             vulnerability_category="Java dependency vulnerability", severity=vuln.get("severity"),
                             source_file=location(item.get("filePath"), project, local_only=True),
+                            affected_filename=first_text(item.get("fileName")),
                             issue_description=first_text(vuln.get("description")),
                             recommended_remediation="Confirm the dependency match, then upgrade to a vendor-supported patched release. For transitive dependencies, update or constrain the parent dependency.",
                             rule_id=identifier, cwe_id=identifiers(CWE, vuln.get("cwes")) or None,

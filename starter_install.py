@@ -110,7 +110,23 @@ def copy_member(destination, name, source):
         target.chmod(0o700)
 
 
-def package_command(system, name, lookup=shutil.which):
+def linux_family():
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        return None
+    identity = release.get("ID", "").lower()
+    relatives = set(release.get("ID_LIKE", "").lower().split())
+    if identity in {"ubuntu", "debian"} or relatives & {"ubuntu", "debian"}:
+        return "debian"
+    if identity == "fedora":
+        return "fedora"
+    if {identity, *relatives} & {"rhel", "centos", "rocky", "almalinux", "ol", "fedora"}:
+        return "rhel"
+    return None
+
+
+def package_command(system, name, lookup=shutil.which, *, family=None):
     if system == "windows" and lookup("winget"):
         ids = {"git": "Git.Git", "java": "EclipseAdoptium.Temurin.21.JDK", "docker": "Docker.DockerDesktop"}
         return ["winget", "install", "--exact", "--id", ids[name], "--source", "winget", "--disable-interactivity"]
@@ -120,12 +136,17 @@ def package_command(system, name, lookup=shutil.which):
     if system == "linux":
         if os.geteuid() != 0:
             raise PermissionError(f"{name} needs installation through an approved Linux package manager; sudo is not invoked")
-        if lookup("apt-get"):
-            packages = {"git": "git", "java": "default-jdk", "docker": "docker.io", "pip": "python3-venv"}
+        family = family or linux_family()
+        python = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        if family in {None, "debian"} and lookup("apt-get"):
+            packages = {"git": "git", "java": "default-jdk", "docker": "docker.io", "pip": f"{python}-venv"}
             return ["apt-get", "install", "-y", packages[name]]
-        if lookup("dnf"):
-            packages = {"git": "git", "java": "java-21-openjdk-devel", "docker": "moby-engine", "pip": "python3-pip"}
-            return ["dnf", "install", "-y", packages[name]]
+        rpm_manager = next((command for command in ("dnf", "yum") if lookup(command)), None)
+        if family in {None, "fedora", "rhel"} and rpm_manager:
+            packages = {"git": "git", "java": "java-21-openjdk-devel",
+                        "docker": "docker-ce" if family == "rhel" else "moby-engine",
+                        "pip": f"{python}-pip" if family == "rhel" else "python3-pip"}
+            return [rpm_manager, "install", "-y", packages[name]]
     raise RuntimeError(f"No approved package manager is available for {name}")
 
 
@@ -142,12 +163,17 @@ def refresh_windows_path():
                 paths.append(os.path.expandvars(winreg.QueryValueEx(registry, "Path")[0]))
         except OSError:
             continue
-    os.environ["PATH"] = os.pathsep.join(paths)
-    programs = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    jdk_locations = sorted((programs / "Eclipse Adoptium").glob("jdk-21*/bin"), reverse=True)
-    for location in [*jdk_locations, programs / "Git/cmd", programs / "Docker/Docker/resources/bin"]:
-        if location.is_dir():
-            os.environ["PATH"] += os.pathsep + str(location)
+    roots = dict.fromkeys(os.environ[key] for key in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")
+                          if os.environ.get(key))
+    for root in map(Path, roots):
+        jdks = sorted((root / "Eclipse Adoptium").glob("jdk-21*/bin"), reverse=True)
+        paths.extend(str(path) for path in [*jdks, root / "Git/cmd", root / "Docker/Docker/resources/bin"]
+                     if path.is_dir())
+    unique = {}
+    for path in os.pathsep.join(paths).split(os.pathsep):
+        if path:
+            unique.setdefault(os.path.normcase(os.path.normpath(path)), path)
+    os.environ["PATH"] = os.pathsep.join(unique.values())
 
 
 class Installer:
@@ -262,8 +288,13 @@ class Installer:
         python = base / ("Scripts/python.exe" if self.system == "windows" else "bin/python")
         pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
         self.records[f"pip:{name}"] = {"status": "installed" if created else "reused", "version": pip.split()[1]}
-        run([python, "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
-             "--retries", "2", f"{name}=={PYPI[name]}"], log=self.log)
+        try:
+            run([python, "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
+                 "--retries", "2", f"{name}=={PYPI[name]}"], log=self.log)
+        except RuntimeError as error:
+            raise RuntimeError(f"Could not install {name} {PYPI[name]} wheels for {self.system}/{self.arch} "
+                               f"with Python {sys.version_info.major}.{sys.version_info.minor}. "
+                               "Check wheel availability and the approved package index in run.log.") from error
 
     def install_archive(self, name):
         version = self.release_version(name)
@@ -272,8 +303,11 @@ class Installer:
             asset_name = release_asset(name, version, self.system, self.arch)
             release = json.loads(fetch(f"https://api.github.com/repos/{repo}/releases/tags/v{version}"))
             asset = next((item for item in release["assets"] if item["name"] == asset_name), None)
-            if not asset or not re.fullmatch(r"sha256:[0-9a-f]{64}", asset.get("digest") or ""):
-                raise RuntimeError(f"No SHA-256 verified upstream asset for {asset_name}")
+            if not asset:
+                raise RuntimeError(f"No upstream {name} {version} package for {self.system}/{self.arch} "
+                                   f"({asset_name}); install a compatible approved binary if available")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", asset.get("digest") or ""):
+                raise RuntimeError(f"No SHA-256 published for {asset_name}")
             url = f"https://github.com/{repo}/releases/download/v{version}/{asset_name}"
             algorithm, expected = asset["digest"].split(":")
         else:

@@ -10,7 +10,7 @@ fail() {
 }
 
 usage() {
-  printf '%s\n' 'Usage: bootstrap.sh [--repository OWNER/REPO] --commit FULL_SHA --archive-sha256 SHA256 [--release-asset] [-- scanner-options]'
+  printf '%s\n' 'Usage: bootstrap.sh [--public | --release-asset] [--repository OWNER/REPO] --commit FULL_SHA --archive-sha256 SHA256 [-- scanner-options]'
 }
 
 project="$(pwd -P)"
@@ -20,6 +20,7 @@ repo=
 commit=
 archive_sha=
 release_asset=false
+public=false
 while (( $# )); do
   case "$1" in
     --repository|--commit|--archive-sha256)
@@ -32,10 +33,12 @@ while (( $# )); do
       shift 2 ;;
     --) shift; break ;;
     --release-asset) release_asset=true; shift ;;
+    --public) public=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; fail "Separate scanner options with --." ;;
   esac
 done
+if $public && $release_asset; then fail "Public archive mode and private release asset mode are mutually exclusive."; fi
 for arg in "$@"; do
   case "$arg" in --project-path|--project-path=*) fail "Run from the application directory to select the scan target." ;; esac
 done
@@ -55,7 +58,9 @@ case "$(uname -m)" in
   *) fail "Unsupported processor architecture." ;;
 esac
 
-if [[ -z $repo ]] && command -v git >/dev/null; then
+if [[ -z $repo ]] && $public; then
+  repo=sumanthcloudm-sudo/Accidion-repo
+elif [[ -z $repo ]] && command -v git >/dev/null; then
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   git_root="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null || true)"
   # Use origin only if this script is at the kit checkout root, never the caller's project origin.
@@ -72,7 +77,7 @@ if [[ -z $repo ]] && command -v git >/dev/null; then
   fi
 fi
 [[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-  fail "Confirm the private GitHub repository and pass --repository OWNER/REPO."
+  fail "Confirm the GitHub repository and pass --repository OWNER/REPO."
 [[ $commit =~ ^[a-f0-9]{40}$ && $archive_sha =~ ^[a-f0-9]{64}$ ]] ||
   fail "Supply an approved full lowercase commit SHA and archive SHA-256."
 
@@ -99,23 +104,34 @@ for candidate in "${TMPDIR:-/tmp}" /tmp "${HOME:-/tmp}"; do
 done
 [[ -n $temp_parent ]] || fail "No writable temporary directory outside the application."
 
-token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
-if [[ -z $token ]] && command -v gh >/dev/null; then
-  token="$(gh auth token --hostname github.com 2>/dev/null || true)"
-fi
-[[ $token =~ ^[A-Za-z0-9_-]+$ ]] || fail "Use an approved GitHub CLI login or provide a read-only GH_TOKEN."
-unset GH_TOKEN GITHUB_TOKEN
 api="https://api.github.com/repos/$repo"
 curl_args=(--silent --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180)
+token=
+if ! $public; then
+  token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+  if [[ -z $token ]] && command -v gh >/dev/null; then
+    token="$(gh auth token --hostname github.com 2>/dev/null || true)"
+  fi
+  [[ $token =~ ^[A-Za-z0-9_-]+$ ]] || fail "Use an approved GitHub CLI login or provide a read-only GH_TOKEN."
+fi
+unset GH_TOKEN GITHUB_TOKEN
 status="$(curl -q "${curl_args[@]}" --output /dev/null --write-out '%{http_code}' "$api")" ||
   fail "GitHub is unreachable. Check corporate network or proxy settings."
-[[ $status == 404 ]] || fail "Expected a private repository. Confirm the repository and GitHub access."
+if $public; then
+  [[ $status == 200 ]] || fail "Expected an anonymously accessible public repository."
+else
+  [[ $status == 404 ]] || fail "Expected a private repository. Confirm the repository and GitHub access."
+fi
 
 work="$(mktemp -d "$temp_parent/accidion-kit.XXXXXXXX")" || fail "Could not create a private temporary directory."
 trap 'rm -rf -- "$work"' EXIT
 mkdir -- "$work/kit"
 printf 'Accidion bootstrap: %s/%s, retrieving reviewed revision %s\n' "$system" "$arch" "$commit"
-if $release_asset; then
+if $public; then
+  curl -q "${curl_args[@]}" --fail --location --max-redirs 3 --retry 2 \
+    --output "$work/kit.tar.gz" "$api/tarball/$commit" ||
+    fail "Pinned public archive download failed. Check the commit and network policy."
+elif $release_asset; then
   command -v gh >/dev/null || fail "An approved GitHub CLI installation is required for release asset retrieval."
   GH_TOKEN="$token" gh release download "kit-$commit" --repo "$repo" --pattern 'accidion-kit.tar.gz' \
     --output - </dev/null > "$work/kit.tar.gz" 2>/dev/null ||
@@ -134,4 +150,4 @@ for path in bootstrap.sh security-scan.sh starter_kit.py starter_install.py star
   [[ -f $work/kit/$path && ! -L $work/kit/$path ]] || fail "Verified archive is missing a regular $path."
 done
 ACCIDION_KIT_COMMIT="$commit" ACCIDION_KIT_ARCHIVE_SHA256="$archive_sha" \
-  bash "$work/kit/security-scan.sh" "$@" --project-path "$project"
+  "$BASH" "$work/kit/security-scan.sh" "$@" --project-path "$project"

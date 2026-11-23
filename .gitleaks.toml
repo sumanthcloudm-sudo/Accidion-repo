@@ -3,16 +3,20 @@ title = "Accidion Gitleaks Security Rules"
 [extend]
 useDefault = true
 
+[allowlist]
+description = "Exclude generated Accidion scanner artifacts"
+paths = ['''(?i)(?:^|[\\/])(?:gitleaks-report|semgrep-report|dependency-check-report|syft-sbom|grype(?:-sbom)?-report|checkov-report|security-summary)\.json$''']
+
 [[rules]]
 id = "hardcoded-password"
 description = "Hardcoded password detected"
-regex = '''(?im)\bpassword\s*=\s*["']?([a-zA-Z0-9_@!#$%.-]+)(?:["']|[ \t]*(?:$|[;#]))'''
+regex = '''(?im)\bpassword\s*=\s*["']?([a-zA-Z0-9_@!#$%.-]+)(?:["']|[ \t\r]*(?:$|[;#]))'''
 secretGroup = 1
 tags = ["password", "credentials"]
 
 [[rules]]
 id = "hardcoded-token"
 description = "Hardcoded token detected"
-regex = '''(?im)\btoken\s*=\s*["']?([a-zA-Z0-9_@!#$%.-]+)(?:["']|[ \t]*(?:$|[;#]))'''
+regex = '''(?im)\btoken\s*=\s*["']?([a-zA-Z0-9_@!#$%.-]+)(?:["']|[ \t\r]*(?:$|[;#]))'''
 secretGroup = 1
 tags = ["token", "credentials"]

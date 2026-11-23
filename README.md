@@ -2,7 +2,45 @@
 
 Run the kit from an existing Java project. The bootstrap downloads the approved kit revision and passes the application directory to the scanner workflow through its current working directory.
 
-## One command from your Java project
+## Run from the public GitHub repository
+
+From your Java application's directory, open Git Bash on Windows or Bash on macOS or Linux. The public workflow needs Bash 3.2 or later, curl 7.83.1 or later, tar with gzip, sha256sum or shasum, HTTPS access to GitHub, and a writable temporary directory outside your project. It retrieves the kit anonymously and can install Git and the other supported prerequisites after download. Paste the following as one Bash command, substituting the three values from the reviewed release handoff. Append --dry-run to the final line for a preview without installations or scans.
+
+~~~bash
+bash -c '
+set +x
+set -euo pipefail
+umask 077
+unset GH_TOKEN GITHUB_TOKEN
+rev=$1 bootstrap_sha=$2 archive_sha=$3
+shift 3
+[[ $rev =~ ^[a-f0-9]{40}$ && $bootstrap_sha =~ ^[a-f0-9]{64}$ && $archive_sha =~ ^[a-f0-9]{64}$ ]] ||
+  { echo "Supply the reviewed commit and both SHA-256 digests." >&2; exit 2; }
+app="$(pwd -P)"
+parent=
+for candidate in "${TMPDIR:-/tmp}" /tmp "${HOME:-/tmp}"; do
+  path="$(cd -- "$candidate" 2>/dev/null && pwd -P)" || continue
+  case "$path/" in "${app%/}/"*) continue ;; esac
+  if [[ -w $path ]]; then parent=$path; break; fi
+done
+[[ -n $parent ]] || { echo "No writable temporary directory outside the application." >&2; exit 2; }
+work="$(mktemp -d "$parent/accidion-public.XXXXXXXX")"
+trap "rm -rf -- \"\$work\"" EXIT
+curl -q --fail --silent --show-error --proto "=https" --connect-timeout 15 --max-time 60 \
+  "https://raw.githubusercontent.com/sumanthcloudm-sudo/Accidion-repo/$rev/bootstrap.sh" \
+  --output "$work/bootstrap.sh"
+if command -v sha256sum >/dev/null; then digest="$(sha256sum < "$work/bootstrap.sh")"
+else digest="$(shasum -a 256 < "$work/bootstrap.sh")"; fi
+[[ ${digest%% *} == "$bootstrap_sha" ]] || { echo "Bootstrap SHA-256 mismatch." >&2; exit 2; }
+"$BASH" "$work/bootstrap.sh" --public --commit "$rev" --archive-sha256 "$archive_sha" -- "$@"
+' accidion-public FULL_COMMIT_SHA BOOTSTRAP_SHA256 KIT_ARCHIVE_SHA256
+~~~
+
+The release handoff contains the full reviewed public commit SHA, the SHA-256 of bootstrap.sh at that commit, and the SHA-256 of the exact anonymous response from https://api.github.com/repos/sumanthcloudm-sudo/Accidion-repo/tarball/FULL_COMMIT_SHA, following its HTTPS redirect. Distribute these through a trusted channel after review. If the archive digest changes, the workflow stops before extraction. Reverify the upstream bytes and update the handoff before retrying. The public workflow does not use a private release asset.
+
+The kit creates fresh JSON reports under $HOME/.accidion/reports/<application-name>/scan-<UTC-date-time>-<id>/. The scan uses your application's files and dependencies. Successful applicable stages produce their individual outputs, with the Syft inventory kept separate. The summary captures scan counts, issue names, severity, paths and line ranges where available, descriptions, impact, remediation, and failure or skip reasons. Use --report-dir for a different parent outside the application.
+
+## One command from your Java project (private distribution)
 
 Ask your administrator for read access to your organization's private Accidion distribution repository and complete any required SSO authorization. Install GitHub CLI through your approved channel and sign in once with gh auth login --hostname github.com, or have your credential manager inject an approved read-only GH_TOKEN. Open Windows Git Bash or Bash on macOS or Linux in your Java application directory. Paste the complete command below with the four values supplied in the approved release handoff. Append --dry-run to verify retrieval and project discovery without installing or scanning.
 
@@ -117,7 +155,10 @@ If Git is unavailable, download and extract the complete kit ZIP from the authen
 ## Prerequisites and installation
 
 - **Launcher** requires Bash and standard shell utilities. Git for Windows supplies Bash and Git. Start from Git Bash on Windows. The launcher accepts x86-64 and ARM64, subject to upstream package availability. Python 3.10 or later is required. Python 3.12 is the recommended starting point for the scanner wheels.
-- **Windows** uses WinGet for supported missing prerequisites when available. **macOS** uses an existing approved Homebrew installation. **Linux** uses APT or DNF for supported system packages only when the process already has the necessary permissions. The kit never invokes an elevation command, changes Docker group membership, bypasses signing rules, or accepts WinGet agreements for you. A platform installer may prompt. If policy blocks it, have IT provision the package or add an approved existing installation to PATH.
+- **Windows 10/11** uses Git Bash and native Windows Python. When available, WinGet can provision supported missing prerequisites. The kit locates Windows system utilities from the operating system and does not require a manual PATH edit.
+- **macOS Intel and Apple Silicon** use the same Bash command and an existing approved Homebrew installation for missing system prerequisites. The kit selects packages for the architecture of the running interpreter. Use a native shell and interpreter when your organization requires native ARM64 executables.
+- **Linux Ubuntu and Debian** use APT. **Fedora** uses DNF. **RHEL-compatible distributions** use DNF or YUM and can bootstrap Python 3.12 when it is available from approved repositories. Package operations require existing privileges. Docker on an RPM-based distribution requires the engine package to be available in an already configured repository. [RHEL Python package suites](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/installing_and_using_dynamic_programming_languages/assembly_installing-and-using-python_installing-and-using-dynamic-programming-languages)
+- **Permissions and package availability** vary by system and architecture. The kit reuses compatible installations, checks the upstream asset name and digest for the detected platform, and records unavailable native packages or wheel installation failures in the same JSON summary on all platforms. The kit does not invoke privilege elevation, change Docker group membership, modify package repositories, or accept WinGet agreements. If policy blocks installation, have IT provision an approved compatible executable and then use --no-install.
 - **Java and builds** need a JDK with javac, version 11 or newer for Dependency-Check, and a JDK compatible with the target application's build and wrapper. Set JAVA_HOME to your approved compatible JDK if needed. Use the project's Maven or Gradle wrapper for an install-enabled scan. Otherwise the kit looks for a compatible CLI and can download a pinned Maven or Gradle distribution.
 - **Docker** is only needed with the image options. A supported package manager can install a missing Docker CLI, but Docker Desktop or Engine must be running and the account must already have approved daemon access. Configuring services or restarting the machine is an administrative step.
 - **Network access** may be needed for approved OS repositories, GitHub release metadata and assets, Python package indexes, Apache Maven and Gradle distributions, application artifact repositories, and vulnerability feeds. Follow corporate proxy, certificate, registry and repository settings. Keep SSH keys, tokens and local build credentials in approved credential stores.
@@ -163,7 +204,9 @@ Discovery covers conventional Maven reactors and Gradle builds with standard Jav
 
 ## Reports
 
-Reports go to a unique directory under $HOME/.accidion/reports by default. Set ACCIDION_HOME to relocate both report and tool-cache defaults. Set --report-dir to override only the parent report directory. Both locations must be outside the scanned project. The run directory uses owner-only permissions on POSIX and restricted ACL inheritance on Windows. Use a private, ACL-capable volume and keep reports and run.log out of Git and shared storage.
+Reports go to a unique timestamped directory under $HOME/.accidion/reports/<application-name>/ by default. The kit uses the Maven name or artifact ID, Gradle root name, or directory name, then converts it to a safe lowercase folder name. Set ACCIDION_HOME to relocate report and cache defaults, or --report-dir to override the report parent. These directories must be outside the scanned project. The run directory uses owner-only permissions on POSIX and restricted ACL inheritance on Windows. Git Bash users do not need to edit PATH for the Windows ACL check. Use a private, ACL-capable volume and keep reports and run.log out of Git and shared storage.
+
+OWASP Dependency-Check stores its database in ACCIDION_HOME/dependency-check-data. Grype defaults to ACCIDION_HOME/grype-db and honors an approved GRYPE_DB_CACHE_DIR override. Both paths persist across runs, including with --no-install. Scanners still apply their normal feed freshness and update policy. A first run or stale cache can take longer. The summary records each cache path and whether it already had content before that scanner ran. [Grype database configuration](https://oss.anchore.com/docs/reference/grype/configuration/)
 
 | File | Contents |
 |---|---|
@@ -194,6 +237,8 @@ This fixture illustrates the schema. The values do not represent an application 
   "vulnerability_category": "SQL Injection",
   "severity": "ERROR",
   "source_file": "src/main/java/example/Search.java",
+  "affected_filename": "Search.java",
+  "relative_file_path": "src/main/java/example/Search.java",
   "start_line": 42,
   "end_line": 43,
   "issue_description": "SQL injection risk due to unsafe query concatenation",
@@ -219,6 +264,27 @@ This fixture illustrates the schema. The values do not represent an application 
 
 Use totalFindings, findingsBySeverity and findingsByScanner for triage, then use issues and the referenced native report for evidence. Use sbomComponentCount to track inventory separately. For a credential finding, verify validity and rotate or revoke it before removing the source exposure. For a dependency finding, verify the installed coordinate and the advisory's supported fix, update the direct dependency or its transitive parent, and rerun. For source and infrastructure findings, confirm the source location and rule context before applying the recommended change. The kit does not edit the application.
 
+### Example scanner and inventory totals
+
+This excerpt uses synthetic counts. The full summary also contains each scanner's status and report location and the complete issues array.
+
+~~~json
+{
+  "applicationName": "Example Java App",
+  "totalFindings": 2,
+  "findingsBySeverity": {"ERROR": 1, "HIGH": 1},
+  "findingsByScanner": {
+    "gitleaks": 0,
+    "semgrep": 1,
+    "dependency-check": 0,
+    "syft": 0,
+    "grype": 1,
+    "checkov": 0
+  },
+  "sbomComponentCount": 3
+}
+~~~
+
 A completed run exits with 0 when required operations succeeded, 1 for recorded required installation or scan failures, or 2 for usage or startup errors. Findings alone do not change the exit status.
 
 ## Troubleshooting
@@ -228,6 +294,8 @@ A completed run exits with 0 when required operations succeeded, 1 for recorded 
 | Bootstrap expects a private repository | Confirm the GitHub slug and its visibility. Use an approved private destination. |
 | Pinned download fails | Check authenticated read access, SSO, the reviewed commit, and network access to GitHub's API and archive service. |
 | Bootstrap or archive SHA-256 mismatch | Get the approved release pins and digests from your administrator. Execution stops before the affected download is run or extracted. |
+| Anonymous download is rate-limited | Wait for GitHub's anonymous rate limit to reset, or contact your administrator for an approved distribution method. |
+| Native and summary counts differ | Check the scanner's nativeFindingCount, findingCount, status, and reason in security-summary.json. The individual report retains the evidence for inspection. |
 | Tool missing or blocked by endpoint protection | Review the installation reason and private log. Ask IT for an approved compatible installation and retry with --no-install. |
 | Python venv or pip cannot install a scanner | Check the Python version, package-index policy and compatible wheel availability. On Linux, ask IT to provision Python's venv support if necessary. |
 | Dependency resolution fails | Check JAVA_HOME, wrapper compatibility, repository authentication, and the build configuration. Test from the affected module. |
@@ -238,10 +306,24 @@ A completed run exits with 0 when required operations succeeded, 1 for recorded 
 
 ## Local validation
 
+To validate the Accidion sample already in this repository, run this single command from the repository root. The scan target is src, so bootstrap code, tests, workspace caches, and the root reports folder are outside the target.
+
+~~~bash
+ACCIDION_HOME="$(pwd -P)/.accidion" bash ./security-scan.sh --project-path ./src --report-dir ./reports
+~~~
+
+Each run creates reports/<application-name>/scan-<UTC-date-time>-<id>/ in the checkout. The workspace .accidion and reports directories are ignored by Git. The source scan also excludes the named generated JSON artifacts, including the legacy Dependency-Check report under src/target.
+
+The summary provides affected_filename and relative_file_path alongside source_file. For example, a dependency scanner may report a JAR filename without identifying where it appears in the project's source. In that case the relative path and line numbers remain null. OpenTofu .tofu and .tofu.json files are detected and listed as unsupported inputs for the current Checkov integration. Terraform-compatible .tf and .tf.json files remain supported. [Checkov native OpenTofu extension support](https://github.com/bridgecrewio/checkov/pull/7401)
+
 ~~~bash
 bash -n security-scan.sh
 python -B -m unittest discover -s tests -v
 bash ./security-scan.sh --dry-run
 ~~~
 
-The tests run the pasted bootstrap with a mocked HTTPS transport and a local tar archive, and simulate platform selection, installers and scanner execution. The fixtures verify scan ordering, external project discovery, issue names and numbering, report locations, and cross-report redaction. A native dry run checks launcher and discovery only. Live private GitHub access, real installations and end-to-end scanning should be verified separately on each supported platform before organization-wide rollout.
+The suite runs the actual Bash launcher against a temporary Java project and exercises native report-directory permissions. Separate tests mock the network, installers, and scanners to validate package selection, scan order, report reconciliation, and redaction without running security scans.
+
+Run the same local checks on each supported host. A native dry run verifies detection and discovery, while mocked scans exercise report generation without calling the security tools. For a restricted workspace, set TMPDIR, TMP, and TEMP to an ignored workspace directory before running the launcher and scanner tests.
+
+The kit completed a live scanner run on Windows x86-64 using Git Bash. The final Windows and Ubuntu WSL checks covered the launcher, report-directory creation, and mocked scanner behavior. Native macOS and standalone Linux end-to-end validation are pending.
