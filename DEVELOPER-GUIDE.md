@@ -12,7 +12,7 @@ git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devseco
 ### Step 2 - Navigate to your Java application
 
 ```bash
-cd "/c/Users/YOUR_USERNAME/projects/employee-management"
+cd "$HOME/projects/my-java-app"
 ```
 
 Replace the example path with your actual application directory.
@@ -86,7 +86,7 @@ Accidion discovers application source, build files, Java archives and supported 
 
 ## 2. Quick start: clone once, scan with one command
 
-Follow the [Quick Start](#quick-start---scan-your-completed-java-application) at the top of this guide after building and testing your application and checking the prerequisites in Section 4. Use Git Bash on Windows or Bash on Linux/macOS, with Git already installed. Keep Accidion outside your application and replace example paths with your actual paths.
+Follow the [Quick Start](#quick-start---scan-your-completed-java-application) at the top of this guide after building and testing your application and checking the prerequisites in Section 4. Use an Ubuntu Bash terminal with Git already installed. Keep Accidion outside your application and replace example paths with your actual paths.
 
 Clone the kit only once. For subsequent scans, enter your application root and repeat the scan command from Quick Start. Use an organization-approved kit revision and review changes before updating it.
 
@@ -184,90 +184,105 @@ Open a pull request from feature/employee-management into develop. Include the t
 
 GitHub branch protection, required reviewers and automated checks must be configured separately by authorized administrators. This documentation does not enable or enforce them.
 
-## 6. Mandatory developer security rules (proposed team policy)
+## 6. Mandatory developer security rules
 
-These requirements are proposed for approval by the organization's security and engineering owners. Once adopted, developers must follow them alongside existing organizational policies.
+These are the developer requirements proposed for adoption by the organization's engineering and security owners. Follow them together with existing organizational policies. Where an organizational policy is stricter, the stricter policy applies.
 
-- Build and test the Java application before scanning. Scan only authorized, trusted applications from the intended application root.
-- Use an approved Accidion revision and approved tool and package sources. Never bypass endpoint protection, permissions or integrity checks.
-- Never hardcode or commit credentials, passwords, tokens or private keys. Use approved secret management. Report exposure and revoke or rotate valid exposed credentials.
-- Use parameterized SQL queries, validate untrusted input, enforce authorization and avoid unsafe execution of user-controlled input.
-- Use supported dependencies from approved repositories; review direct and transitive dependencies and apply supported security fixes.
-- Apply least privilege and secure infrastructure settings. Scan applicable infrastructure and explicitly select image scanning when required.
-- Run all applicable security scans before integration or release and after relevant changes.
-- Review all findings, including UNKNOWN severity and Semgrep ERROR. Investigate failed scanners and document legitimate skips.
-- Never disable scanners, suppress findings without approval or alter reports to conceal results.
-- Fix confirmed vulnerabilities according to team risk policy. Escalate unresolved risks and obtain authorized exceptions with supporting evidence.
-- Rebuild, test and rescan after remediation.
-- Protect JSON reports and diagnostic logs in approved access-controlled storage. Never publish confidential reports or credentials.
-- Retain the latest scan summary and approved exceptions for review.
+### 6.1 Rules every developer must follow
 
-| Security issue | Expected developer action |
+1. **Build and test first.** Build and run the application's approved tests before scanning. Scan the intended application root and revision.
+2. **Use approved software.** Use an organization-approved Accidion revision, scanner versions, dependency repositories and package sources. Do not bypass integrity checks or endpoint controls.
+3. **Protect credentials.** Never hardcode or commit passwords, API keys, tokens, certificates or private keys. Use approved secret management. If a real credential is exposed, report it immediately and revoke or rotate it; removing the text from the latest commit is not sufficient.
+4. **Validate inputs.** Validate untrusted input at trust boundaries, enforce authorization on every protected operation and use safe output handling.
+5. **Prevent injection.** Use parameterized SQL queries and bound values. Do not construct executable commands, SQL or scripts from untrusted input.
+6. **Manage dependencies.** Use supported dependencies from approved repositories. Review direct and transitive dependencies, verify the resolved version and upgrade vulnerable packages using a compatible supported fix.
+7. **Apply least privilege.** Give application users, services, containers and infrastructure only the permissions they require. Do not run application containers as root unless an approved exception requires it.
+8. **Scan at the right points.** Run all applicable scans before integration and release, and repeat scans after relevant source, dependency, build or infrastructure changes.
+9. **Review every result.** Investigate all findings, including UNKNOWN severity, Semgrep ERROR and findings without source line numbers. Check the native scanner evidence and advisory; do not assume missing data means no risk.
+10. **Do not hide findings.** Never disable a scanner, alter a report, suppress a rule or add an allowlist exception to conceal a finding. Any suppression or exception requires documented approval from the authorized security owner.
+11. **Remediate and verify.** Fix confirmed vulnerabilities according to the organization's risk policy. Rebuild, rerun tests and rescan after remediation.
+12. **Escalate unresolved risk.** If a finding cannot be fixed, a scanner fails, or coverage is incomplete, notify the designated security owner. Obtain a documented risk exception before release when policy requires it.
+13. **Protect evidence.** Treat JSON reports, logs, SBOMs and source paths as potentially sensitive. Store and share them only through approved access-controlled locations.
+14. **Do not overstate results.** A successful scan is not proof of zero vulnerabilities, complete coverage, exploitability or regulatory compliance.
+
+### 6.2 Developer responsibilities
+
+- Keep changes on the approved feature, bug-fix or security branch; do not push directly to protected branches.
+- Include build and test results in the pull request.
+- Identify the Accidion revision and scan run used for security review.
+- Link to approved report storage rather than attaching confidential reports to public pull requests.
+- Explain remediation for confirmed findings and identify any outstanding risk or coverage gap.
+- Request review from the designated code owner and security reviewer.
+
+### 6.3 Security and release-owner responsibilities
+
+- Approve the organization's severity thresholds, remediation deadlines and exception process.
+- Review escalated findings, scanner failures and proposed suppressions.
+- Record risk owner, justification, compensating controls, approval and expiry/review date for each accepted exception.
+- Configure branch protection, required reviews and CI release gates separately. Accidion documentation does not configure or enforce these controls by itself.
+- Make the final release decision under the organization's approved policy.
+
+### 6.4 Expected response to common findings
+
+| Finding or condition | Required developer response |
 | --- | --- |
-| Exposed credential | Report exposure, revoke or rotate the credential, and remove it from source |
-| Potential SQL injection | Verify the finding and use parameterized queries |
-| Vulnerable Java dependency | Upgrade to a supported patched version and verify resolved dependencies |
-| Vulnerable container package | Update affected packages or base image, rebuild and rescan |
-| Insecure infrastructure | Correct the configuration and verify the result |
-| Failed scanner | Resolve the failure or escalate it; rescan before accepting coverage |
+| Real exposed credential | Report immediately; revoke or rotate it; remove it from source and follow incident response |
+| Potential SQL injection | Verify the data flow and use parameterized queries |
+| Vulnerable Java dependency | Verify the resolved package and advisory; update the direct dependency or approved parent/constraint |
+| Vulnerable container package | Update the package or base image, rebuild and rescan |
+| Insecure infrastructure | Correct the resource configuration and rerun Checkov |
+| UNKNOWN severity or Semgrep ERROR | Investigate the evidence; do not automatically classify as low risk |
+| Failed applicable scanner | Resolve and rerun, or escalate the coverage gap for authorized review |
+| Unexpected skipped scanner | Confirm applicability and document the reason; do not treat it as a clean result |
 
-These are developer process requirements, not automatically enforced release gates. Follow the organization's approved release and exception process.
+These requirements are a documented team process, not an automated release gate unless the organization separately configures and enforces one.
 
-## 7. Windows 10/11
+## 7. Supported developer environment: Ubuntu
 
-Install Git for Windows through your approved channel and open **Git Bash**, not Command Prompt or PowerShell. Example:
+The documented developer workflow for this project targets Ubuntu Linux. Fresh Ubuntu end-to-end validation is still pending; these instructions describe the intended workflow and prerequisite requirements, not a claim that every Ubuntu release has been validated.
+
+### 7.1 System prerequisites
+
+Check the tools available on your machine:
 
 ```bash
 git --version
-mkdir -p "$HOME/devsecops"
-git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
-cd "/c/Users/YOUR_USERNAME/projects/my-java-app"
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
+python3 --version
+java -version
 ```
 
-Replace YOUR_USERNAME and the project path. WinGet can install supported missing prerequisites where policy permits. Native Python is required. For WSL, use the Linux instructions and Linux tools instead.
+You need Bash, Git, Python 3.10 or newer with matching virtual-environment support, a compatible JDK (Java 11 or newer for Dependency-Check), approved network access and a writable home directory.
 
-## 8. Ubuntu (including WSL)
+If a system prerequisite is missing, ask your Ubuntu administrator to install it from approved package sources. For example, an administrator may provision Git and Python virtual-environment support using the organization's approved package-management process. Accidion does not invoke sudo and does not bypass operating-system permissions. Run the scan as your normal developer account, not as root.
 
-Open an Ubuntu Bash terminal. Where permitted, have an administrator provision missing system packages; for example, on Ubuntu with a compatible Python version:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git python3 python3-venv
-```
-
-The kit itself does not invoke sudo. Run the scanner as your normal developer account:
+### 7.2 Clone the toolkit
 
 ```bash
 mkdir -p "$HOME/devsecops"
 git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
+```
+
+Keep the toolkit checkout separate from the application repository. Use an organization-approved revision.
+
+### 7.3 Scan your Java application
+
+```bash
 cd "$HOME/projects/my-java-app"
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
 ```
 
-## 9. Standalone Linux
+Replace the example path with the actual application root. Alternatively, pass the project path explicitly using `--project-path`.
 
-Debian/Ubuntu use APT; Fedora uses DNF; RHEL-compatible systems use DNF/YUM and may require Python 3.12 packages from approved repositories. Ask IT to provision Git, Python, a compatible JDK and other missing system packages as needed. Existing root privileges are required for automatic Linux system-package operations on this branch. Do not run the entire scan as root merely to install prerequisites.
+### 7.4 Ubuntu installation limitations
 
-```bash
-mkdir -p "$HOME/devsecops"
-git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
-cd "$HOME/projects/my-java-app"
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
-```
+- The launcher does not invoke sudo or elevate privileges.
+- Installing system packages may require an administrator.
+- Python virtual-environment support must match the selected Python interpreter.
+- Java, Maven/Gradle repositories and vulnerability databases must be reachable through approved network routes.
+- A missing prerequisite or denied installation can cause a scanner stage to fail; inspect the run log and summary.
+- Do not run the full toolkit as root merely to get past an installation error.
 
-## 10. macOS
-
-Open Terminal and use Bash. Install Git and approved Homebrew if needed. Homebrew can provision supported missing prerequisites. Both Intel and Apple Silicon are recognized, subject to compatible distributions.
-
-```bash
-mkdir -p "$HOME/devsecops"
-git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
-cd "$HOME/projects/my-java-app"
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
-```
-
-Native macOS and standalone Linux end-to-end validation is not established by the previous public guide; these instructions describe implemented platform paths, not a new live test.
+Windows, macOS and standalone Linux instructions are intentionally not part of this Ubuntu-focused developer workflow. Their platform paths require separate validation before being documented as supported developer environments.
 
 ## 11. Automatic installation and reuse
 
@@ -587,7 +602,7 @@ Exit code 0 alone is not release approval. The designated release authority make
 For implementation details see the [README](README.md). This guide describes the public checkout workflow and its current configurations. It does not claim validation of every OS, architecture, rule, or live scan.
 
 
-## 29. Enhanced security reporting
+## 10. Enhanced security reporting
 
 The current implementation includes scanner timing, SBOM component output, Maven JSON dependency-tree collection and Maven coordinates when Grype supplies Maven artifact metadata. Fresh Ubuntu installation and separate external Java application end-to-end validation remain pending.
 
