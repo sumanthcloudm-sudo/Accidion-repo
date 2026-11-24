@@ -236,7 +236,7 @@ Scan without kit-managed installation:
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --no-install
 ```
 
-These execution modes are mutually exclusive.
+The --dry-run and --setup-only modes are mutually exclusive. The --no-install option can be combined with either mode.
 
 ## Optional Container Image Scanning
 
@@ -283,6 +283,24 @@ Subsequent scans can reuse compatible tools and caches.
 - Review failed and skipped scanners before accepting scan coverage.
 - Successful execution does not mean zero vulnerabilities.
 - Treat generated security reports as sensitive information.
+
+## Enhanced Security Reporting
+
+The toolkit provides enhanced dependency and inventory details when matching scanner evidence is available:
+
+- Maven dependency tree collection during dependency resolution.
+- Direct and transitive dependency identification.
+- Parent dependency name and version, where a unique relationship can be established.
+- Dependency chains and matching Maven declaration file and line numbers.
+- Dependency-specific remediation guidance.
+- Individual SBOM component details.
+- Available tool installation and scanner execution durations, plus total scan duration.
+
+Developers do not need to run a separate Maven dependency-tree command. These details depend on successful dependency resolution and available scanner evidence. Maven dependency-chain enrichment is not equivalent to runtime exploitability analysis; equivalent Gradle chain enrichment is not currently documented as implemented.
+
+## Ubuntu Installation Notes
+
+The launcher does not invoke sudo. Python 3.10+, matching virtual-environment support, Git and a compatible JDK may require administrator-approved installation. If prerequisites cannot be installed under the developer account, contact the authorized administrator. Fresh Ubuntu and external Java application end-to-end validation remain pending.
 
 ## Additional Documentation
 
