@@ -461,4 +461,33 @@ Do not send tokens, raw secrets, source code or sensitive reports to unauthorize
 - [ ] Application rebuilt/tested and rescanned.
 - [ ] Latest reports reviewed and retained through approved channels.
 
+## 26. Mandatory developer security rules (proposed team policy)
+
+These requirements are proposed for approval by the organization's security and engineering owners. Once adopted, developers must follow them alongside existing organizational policies.
+
+- Build and test the Java application before scanning. Scan only authorized, trusted applications from the intended application root.
+- Use an approved Accidion revision and approved tool and package sources. Never bypass endpoint protection, permissions or integrity checks.
+- Never hardcode or commit credentials, passwords, tokens or private keys. Use approved secret management. Report exposure and revoke or rotate valid exposed credentials.
+- Use parameterized SQL queries, validate untrusted input, enforce authorization and avoid unsafe execution of user-controlled input.
+- Use supported dependencies from approved repositories; review direct and transitive dependencies and apply supported security fixes.
+- Apply least privilege and secure infrastructure settings. Scan applicable infrastructure and explicitly select image scanning when required.
+- Run all applicable security scans before integration or release and after relevant changes.
+- Review all findings, including UNKNOWN severity and Semgrep ERROR. Investigate failed scanners and document legitimate skips.
+- Never disable scanners, suppress findings without approval or alter reports to conceal results.
+- Fix confirmed vulnerabilities according to team risk policy. Escalate unresolved risks and obtain authorized exceptions with supporting evidence.
+- Rebuild, test and rescan after remediation.
+- Protect JSON reports and diagnostic logs in approved access-controlled storage. Never publish confidential reports or credentials.
+- Retain the latest scan summary and approved exceptions for review.
+
+| Security issue | Expected developer action |
+| --- | --- |
+| Exposed credential | Report exposure, revoke or rotate the credential, and remove it from source |
+| Potential SQL injection | Verify the finding and use parameterized queries |
+| Vulnerable Java dependency | Upgrade to a supported patched version and verify resolved dependencies |
+| Vulnerable container package | Update affected packages or base image, rebuild and rescan |
+| Insecure infrastructure | Correct the configuration and verify the result |
+| Failed scanner | Resolve the failure or escalate it; rescan before accepting coverage |
+
+These are developer process requirements, not automatically enforced release gates. Follow the organization's approved release and exception process.
+
 For implementation details see the [README](README.md). This guide describes the public checkout workflow and its current configurations. It does not claim validation of every OS, architecture, rule, or live scan.
