@@ -521,4 +521,72 @@ An exception should record the affected finding or coverage gap, justification, 
 
 Exit code 0 alone is not release approval. The designated release authority makes the final decision under approved organizational policy.
 
+## 28. Developer Git branching strategy (proposed team policy)
+
+This Git Flow-style strategy requires engineering and security owner approval. Follow the existing approved application repository policy if it differs. Create branches in your Java application repository, not the Accidion toolkit checkout.
+
+| Branch | Purpose | Created by | Base / merge target |
+| --- | --- | --- | --- |
+| main | Stable production-ready code | Repository administrator | Approved release or hotfix PR |
+| develop | Feature integration | Repository administrator | Initially main |
+| feature/* | New functionality | Developer | develop / develop |
+| bugfix/* | Non-production bug fixes | Developer | develop / develop |
+| security/* | Security remediation | Developer | develop / develop |
+| release/* | Release preparation | Release team | develop / main; synchronize back to develop |
+| hotfix/* | Urgent production fixes | Authorized developer | main / main; synchronize back to develop |
+
+Administrators provision and protect shared branches. If develop does not exist, confirm the approved integration branch with the repository owner.
+
+### Example: Employee Management feature
+
+Open Git Bash or Bash in the Java application repository. Verify the remote and ensure the working tree is clean before switching branches.
+
+```bash
+git remote -v
+git status
+git switch develop
+git pull --ff-only origin develop
+git switch -c feature/employee-management
+```
+
+Develop the assigned Java changes on this branch. Build and test using the application-approved Maven or Gradle commands. From the application root, run:
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
+```
+
+Select applicable image scanning options when required. Review security-summary.json, investigate failed or skipped scans, fix findings, rebuild, test and rescan according to Sections 26 and 27.
+
+Review and stage only intended files:
+
+```bash
+git status
+git diff
+git add src/
+git diff --cached
+```
+
+Stage any other intended files (such as pom.xml or build.gradle) individually and review the staged diff before committing.
+
+```bash
+git commit -m "Implement employee management feature"
+git push -u origin feature/employee-management
+```
+
+Open a pull request from feature/employee-management into develop. Include the task reference, change summary, test results and approved access-controlled security evidence reference. Obtain required code and security reviews before merging. Retest and rescan relevant changes made after the scan.
+
+### Developer branching rules
+
+- Never develop or push directly to protected main or develop branches.
+- Create one task branch per feature, bug fix or security task; use meaningful names such as feature/APP-123-employee-search or security/APP-456-dependency-update.
+- Keep branches current using the approved merge or rebase process; do not overwrite other developers' work.
+- Build, test and run applicable security scans before opening a pull request and after relevant changes.
+- Fix confirmed vulnerabilities and follow the release acceptance and exception criteria in Section 27.
+- Never commit credentials, confidential reports or unauthorized generated files.
+- Obtain required code and security reviews; never bypass branch protection or required checks.
+- Release and hotfix merges require designated release authority approval and synchronization back to develop.
+- Delete merged task branches according to team policy.
+
+GitHub branch protection, required reviewers and automated checks must be configured separately by authorized administrators. This documentation does not enable or enforce them.
+
 For implementation details see the [README](README.md). This guide describes the public checkout workflow and its current configurations. It does not claim validation of every OS, architecture, rule, or live scan.
