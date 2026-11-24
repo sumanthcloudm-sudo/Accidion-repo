@@ -289,10 +289,10 @@ Subsequent scans can reuse compatible tools and caches.
 The toolkit provides enhanced dependency and inventory details when matching scanner evidence is available:
 
 - Maven dependency tree collection during dependency resolution.
-- Direct and transitive dependency identification.
-- Parent dependency name and version, where a unique relationship can be established.
-- Dependency chains and matching Maven declaration file and line numbers.
-- Dependency-specific remediation guidance.
+- Maven coordinates in Grype findings when the scanner supplies Maven artifact metadata.
+- Maven dependency tree JSON report when dependency resolution and tree generation succeed.
+- Direct/transitive classification, parent-chain correlation and verified POM line mapping are not yet included in normalized findings.
+- Scanner-provided remediation guidance and fixed-version information where available.
 - Individual SBOM component details.
 - Available tool installation and scanner execution durations, plus total scan duration.
 
