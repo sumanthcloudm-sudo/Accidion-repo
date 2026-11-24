@@ -101,7 +101,9 @@ class StarterKitTests(unittest.TestCase):
             for script in ("bootstrap.sh", "security-scan.sh"):
                 subprocess.run([bash, "-n", str(kit.KIT / script)], check=True, timeout=30)
             result = subprocess.run([bash, str(kit.KIT / "security-scan.sh"), "--dry-run"],
-                                    cwd=app, text=True, capture_output=True, check=True, timeout=30)
+                                    cwd=app, text=True, capture_output=True, check=True, timeout=30,
+                                    env={**os.environ, "ACCIDION_HOME": str(root / "home"),
+                                         "PYTHONDONTWRITEBYTECODE": "1"})
             plan = json.loads(result.stdout)
             self.assertEqual((plan["platform"], plan["architecture"]), (system, arch))
             self.assertEqual(plan["reportApplicationDirectory"], "compatibility-app")
@@ -110,6 +112,99 @@ class StarterKitTests(unittest.TestCase):
             self.assertRegex(run_dir.name, r"^scan-\d{8}T\d{6}Z-")
             kit.write_json(run_dir / "fixture.json", {"smoke": True})
             self.assertEqual(json.loads((run_dir / "fixture.json").read_text()), {"smoke": True})
+
+    def test_launcher_rejects_invalid_requests_before_python_bootstrap(self):
+        bash = host_bash()
+        if not bash:
+            self.skipTest("Bash or Git Bash unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "Application with spaces"
+            project.mkdir()
+            bundle = root / "kit"
+            bundle.mkdir()
+            script = bundle / "security-scan.sh"
+            shutil.copyfile(kit.KIT / script.name, script)
+            for filename in kit.TOOLKIT_FILES:
+                (bundle / filename).touch()
+            def launch(*arguments):
+                # Hide Python and make any package manager call observable.
+                return subprocess.run(
+                    [bash, "-c", 'cd -- "$1" || exit; shift; export PATH=./missing-bin ACCIDION_HOME=./home; '
+                     'uname() { case "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; esac; }; '
+                     'dirname() { printf "%s\\n" "${2%/*}"; }; '
+                     'brew() { echo "bootstrap attempted" >&2; return 1; }; '
+                     'source kit/security-scan.sh "$@"',
+                     "launcher-test", str(root), *arguments],
+                    capture_output=True, text=True, timeout=30,
+                )
+
+            arguments = ("--project-path=./Application with spaces",)
+            self.assertIn("bootstrap attempted", launch(*arguments).stderr)
+            for extra, message in [
+                (("--dry-r",), "Unknown argument"),
+                (("--report-dir", "--no-install"), "requires a value"),
+                (("--image=",), "non-empty value"),
+                (("--image", "local:tag", "--build-image"), "cannot be combined"),
+                (("--setup-only", "--dry-run"), "cannot be combined"),
+                (("--project-path=./missing",), "accessible directory"),
+                (("--report-dir=./Application with spaces/reports",), "outside the application"),
+            ]:
+                with self.subTest(arguments=extra):
+                    result = launch(*arguments, *extra)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("bootstrap attempted", result.stderr)
+            preview = launch(*arguments, "--dry-run", "--no-install")
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            self.assertIn("Python 3.10+ is missing", preview.stdout)
+            self.assertNotIn("bootstrap attempted", preview.stderr)
+            setup = launch(*arguments, "--setup-only", "--no-install")
+            self.assertEqual(setup.returncode, 2, setup.stderr)
+            self.assertIn("installation disabled", setup.stderr)
+            self.assertNotIn("bootstrap attempted", setup.stderr)
+            (bundle / "semgrep.yml").unlink()
+            incomplete = launch(*arguments)
+            self.assertEqual(incomplete.returncode, 2, incomplete.stderr)
+            self.assertIn("semgrep.yml", incomplete.stderr)
+            self.assertNotIn("bootstrap attempted", incomplete.stderr)
+            self.assertEqual(launch("--help").returncode, 0)
+
+    def test_runner_validates_report_and_image_paths_before_provisioning(self):
+        for arguments in (["--ima", "local:tag"], ["--image"], ["--image= "],
+                          ["--report-dir="], ["--dry-run", "--setup-only"],
+                          ["--image", "local:tag", "--build-image"]):
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    kit.args_for(arguments)
+                self.assertEqual(error.exception.code, 2)
+        for mode in ("--setup-only", "--dry-run"):
+            self.assertTrue(kit.args_for([mode, "--no-install"]).no_install)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            file = root / "file"
+            file.touch()
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(root / "home")}), \
+                 patch.object(kit, "Installer") as installer:
+                arguments = ["--project-path", str(project)]
+                for mode in ([], ["--dry-run"]):
+                    for extra, error in [
+                        (["--report-dir", str(project / "reports")], "outside the application"),
+                        (["--report-dir", str(file / "output")], "must be a directory"),
+                        (["--build-image"], "requires a root Dockerfile"),
+                    ]:
+                        with self.subTest(mode=mode, arguments=extra), self.assertRaisesRegex(ValueError, error):
+                            kit.execute(kit.args_for([*arguments, *mode, *extra]), *kit.detect())
+                for name in ("one", "two"):
+                    (project / name).mkdir()
+                    (project / name / "Dockerfile").touch()
+                with self.assertRaisesRegex(ValueError, "exactly one discovered Dockerfile"):
+                    kit.execute(kit.args_for([*arguments, "--build-image"]), *kit.detect())
+                installer.assert_not_called()
+                self.assertFalse((root / "home").exists())
 
     def test_installer_reuses_or_installs_and_reports_failures(self):
         installer = starter_install.Installer("linux", "amd64", Path("mock"), True, None)
