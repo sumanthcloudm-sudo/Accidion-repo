@@ -587,45 +587,28 @@ Exit code 0 alone is not release approval. The designated release authority make
 For implementation details see the [README](README.md). This guide describes the public checkout workflow and its current configurations. It does not claim validation of every OS, architecture, rule, or live scan.
 
 
-## 29. Enhanced security reporting (pending implementation publication)
+## 29. Enhanced security reporting
 
-The following enhancements have been developed locally for the next toolkit update. Use an approved revision containing the corresponding Python changes before relying on these features. External application and fresh Ubuntu end-to-end testing remain pending.
+The current implementation includes scanner timing, SBOM component output, Maven JSON dependency-tree collection and Maven coordinates when Grype supplies Maven artifact metadata. Fresh Ubuntu installation and separate external Java application end-to-end validation remain pending.
 
 ### Individual findings
 
-The enhanced terminal output presents findings one by one: issue number, meaningful issue name, scanner, severity, affected file, available line range, rule and vulnerability identifiers, dependency versions, description, root cause, security impact and recommended remediation. Review the native scanner evidence and advisory before applying fixes. Missing information must not be interpreted as absence of risk.
+The terminal presents normalized findings with issue number, issue name, scanner, severity, available source file and line, vulnerability identifiers, dependency versions, description and recommended remediation. Some fields are unavailable depending on scanner evidence. Always review the native scanner report and advisory before applying a fix.
 
-### Maven dependency relationships
+### Maven dependency tree
 
-Dependency resolution attempts to collect Maven JSON dependency trees automatically. Developers continue to run the same single security-scan.sh command; no separate dependency-tree command is required for this feature.
+For Maven build roots, dependency resolution attempts to generate a JSON tree using Maven Dependency Plugin 3.8.1. When successfully generated, the report is copied into the private scan directory as maven-dependency-tree-<index>.json. This is a dependency graph artifact; it does not yet automatically enrich every normalized finding with a verified parent chain or direct/transitive classification.
 
-When matching evidence is available, dependency findings can include:
-
-- Maven coordinate and installed version.
-- Direct or transitive dependency classification.
-- Dependency chains and, for a unique transitive chain, parent and direct dependency details.
-- Matching direct dependency declaration file and line range.
-- Dependency-specific remediation.
-
-Illustrative chain: application -> jackson-databind:2.9.8 -> jackson-core:2.9.8.
-
-For a confirmed vulnerability in jackson-core, investigate a compatible supported update to jackson-databind or an approved dependency management constraint. Verify the resolved version, rebuild, test and rescan.
-
-Declaration lines identify build manifest declarations, not vulnerable library source code. Exact declaration matching can be unavailable for inherited properties, profiles, BOMs or ambiguous declarations. A project dependency graph match does not establish container package provenance or runtime exploitability. Equivalent Gradle dependency-chain enrichment is not implemented. Multiple scanners can report overlapping findings.
-
-### Additional JSON evidence
-
-The private scan report directory may contain maven-dependency-tree-*.json files when collection succeeds. Enhanced normalized findings may contain dependency_type, dependency_chains, maven_coordinate, parent_dependency, parent_version, direct_dependency, direct_dependency_version, direct_dependency_source_file, direct_dependency_start_line, direct_dependency_end_line and dependency_remediation. These fields are conditional on evidence. Original scanner reports remain available when generated.
+Grype findings include a Maven coordinate when the Grype artifact metadata supplies the Maven group and artifact identifiers. Direct dependency declaration line mapping, parent dependency identification, full finding-to-tree chain correlation and dependency-specific parent upgrade recommendations are not yet implemented in the published source. Do not assume a package coordinate alone proves whether a dependency is direct or transitive.
 
 ### SBOM component output
 
-The enhanced terminal inventory displays individual component numbers, names, groups, types, versions, package URLs, locations and licenses where available. Syft components are inventory, not vulnerability findings.
+After a successful Syft scan, the terminal lists component number, name, version, type, package URL, license and available occurrence locations. Missing metadata is displayed as unavailable. Syft inventory is not itself a vulnerability finding.
 
 ### Execution timing
 
-Enhanced reporting records available installation and scanner start and completion timestamps and durations, together with total scan duration. First-run downloads, dependency resolution, database updates and application size can affect runtime. No fixed runtime is guaranteed.
+Installer records include durationSeconds for tool verification or installation. Scanner records include durationSeconds, including skipped or unavailable scanner entries. The consolidated security summary includes total durationSeconds. These values are elapsed durations, not per-tool start/end timestamps.
 
 ### Ubuntu and external application validation
 
-The documented single-command workflow is intended for supported Java applications, including e-commerce and enterprise projects. Fresh Ubuntu installation and separate application testing are outstanding. The launcher does not invoke sudo; obtain approved Python 3.10+, matching virtual environment support, Git and a compatible JDK from IT where system package installation requires privileges. Run normal scans without elevation. A scan does not certify banking, payment or other regulatory compliance.
-
+The launcher does not invoke sudo. Python 3.10+, matching virtual-environment support, Git and a compatible JDK may require administrator-approved installation. If system prerequisites cannot be installed under the developer account, request an approved installation from IT. Fresh Ubuntu installation and external Java application end-to-end testing remain pending. A successful scan does not certify banking, payment or regulatory compliance.
