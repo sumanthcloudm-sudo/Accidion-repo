@@ -86,16 +86,11 @@ Accidion discovers application source, build files, Java archives and supported 
 
 ## 2. Quick start: clone once, scan with one command
 
-Open Git Bash on Windows or Bash on Linux/macOS. Git must already be available for cloning. Keep the kit outside your application.
+Follow the [Quick Start](#quick-start---scan-your-completed-java-application) at the top of this guide after building and testing your application and checking the prerequisites in Section 4. Use Git Bash on Windows or Bash on Linux/macOS, with Git already installed. Keep Accidion outside your application and replace example paths with your actual paths.
 
-```bash
-mkdir -p "$HOME/devsecops"
-git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
-cd "$HOME/projects/my-java-app"
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
-```
+Clone the kit only once. For subsequent scans, enter your application root and repeat the scan command from Quick Start. Use an organization-approved kit revision and review changes before updating it.
 
-Replace the example application path with your actual path. Run the clone only once. For subsequent scans, enter your application directory and repeat the last command. Use an organization-approved kit revision; review changes before updating it. The local checkout launcher is distinct from the authenticated, digest-pinned public download workflow described in the [README](README.md#run-from-the-public-github-repository). That workflow requires an approved GitHub credential and the three reviewed release values; obtain them from your administrator rather than inventing them.
+The local checkout launcher is distinct from the authenticated, digest-pinned public download workflow. If your organization requires that alternative workflow, obtain its approved instructions, GitHub credential and three reviewed release values from your administrator; do not invent them. See the [README Quick Start](README.md#quick-start) for the documented local checkout workflow.
 
 ## 3. Example application layout
 
