@@ -1,0 +1,56 @@
+{
+  "demonstration": true,
+  "scanner": "OWASP Dependency-Check",
+  "reportType": "Selected normalized findings",
+  "sampleFindingCount": 3,
+  "findings": [
+    {
+      "issue_number": 9,
+      "issue_name": "Vulnerable Java dependency \u2014 CVE-2015-6420 \u2014 commons-collections:commons-collections",
+      "scanner_name": "OWASP Dependency-Check",
+      "severity": "CRITICAL",
+      "affected_filename": "commons-collections-3.2.1.jar",
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "CVE-2015-6420",
+      "cwe_id": [
+        "CWE-502"
+      ],
+      "cve_id": [
+        "CVE-2015-6420"
+      ]
+    },
+    {
+      "issue_number": 10,
+      "issue_name": "Vulnerable Java dependency \u2014 CVE-2018-1000873 \u2014 com.fasterxml.jackson.core:jackson-annotations",
+      "scanner_name": "OWASP Dependency-Check",
+      "severity": "MEDIUM",
+      "affected_filename": "jackson-annotations-2.9.0.jar",
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "CVE-2018-1000873",
+      "cwe_id": [
+        "CWE-20"
+      ],
+      "cve_id": [
+        "CVE-2018-1000873"
+      ]
+    },
+    {
+      "issue_number": 11,
+      "issue_name": "Vulnerable Java dependency \u2014 CVE-2019-14379 \u2014 com.fasterxml.jackson.core:jackson-databind",
+      "scanner_name": "OWASP Dependency-Check",
+      "severity": "CRITICAL",
+      "affected_filename": "jackson-databind-2.9.8.jar",
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "CVE-2019-14379",
+      "cwe_id": [
+        "CWE-1321"
+      ],
+      "cve_id": [
+        "CVE-2019-14379"
+      ]
+    }
+  ]
+}

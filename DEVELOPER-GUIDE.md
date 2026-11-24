@@ -1,5 +1,83 @@
 # Accidion Developer Guide
 
+## Quick Start - Scan Your Completed Java Application
+
+### Step 1 - Clone Accidion once
+
+```bash
+mkdir -p "$HOME/devsecops"
+git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
+```
+
+### Step 2 - Navigate to your Java application
+
+```bash
+cd "/c/Users/YOUR_USERNAME/projects/employee-management"
+```
+
+Replace the example path with your actual application directory.
+Keep Accidion separate from your Java application.
+
+### Step 3 - Run one security scan command
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
+```
+
+Accidion installs or reuses compatible tools where permitted
+and runs applicable security scanners sequentially:
+
+- Gitleaks
+- Semgrep
+- OWASP Dependency-Check
+- Syft
+- Grype
+- Checkov
+
+### Step 4 - Review security reports
+
+Open security-summary.json from the report directory
+displayed in the terminal.
+
+The report contains issue names, scanner names,
+severity, affected filenames, available line numbers,
+security impact and recommended remediation.
+
+Example finding:
+
+| Field | Value |
+|---|---|
+| Issue name | Ensure the last USER is not root |
+| Scanner | Checkov |
+| File | Dockerfile |
+| Line number | 5 |
+| Severity | UNKNOWN |
+
+View selected demonstration findings:
+
+- [Sample Reports](sample-reports/README.md)
+- [Security Summary](sample-reports/security-summary.json)
+
+### Step 5 - Fix and rescan
+
+Open your application in VS Code.
+
+Use Ctrl + P to open the affected file and Ctrl + G
+to navigate to the reported line number.
+
+Fix the security issue, test your application and rescan:
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
+```
+
+Compare the new security summary with the previous report.
+Successful execution does not mean zero vulnerabilities.
+
+---
+
+
+
 For developers who have completed a Java application and want to identify and remediate security issues before delivery. No prior experience with security scanners is required.
 
 ## 1. What Accidion does

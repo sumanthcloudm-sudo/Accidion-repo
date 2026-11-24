@@ -1,0 +1,239 @@
+{
+  "demonstration": true,
+  "description": "Selected findings from an actual local scan. Not a complete scanner report.",
+  "totalScanFindings": 424,
+  "scannerResults": {
+    "gitleaks": {
+      "status": "success",
+      "findingCount": 3
+    },
+    "semgrep": {
+      "status": "success",
+      "findingCount": 5
+    },
+    "dependency-check": {
+      "status": "success",
+      "findingCount": 70
+    },
+    "syft": {
+      "status": "success",
+      "findingCount": 0
+    },
+    "grype": {
+      "status": "success",
+      "findingCount": 332
+    },
+    "checkov": {
+      "status": "success",
+      "findingCount": 14
+    }
+  },
+  "sbomComponentCount": 567,
+  "sampleFindingCount": 15,
+  "issues": [
+    {
+      "issue_number": 1,
+      "issue_name": "Hardcoded password detected",
+      "scanner_name": "Gitleaks",
+      "severity": "UNKNOWN",
+      "affected_filename": "prod-config.conf",
+      "start_line": 1,
+      "end_line": 1,
+      "rule_id": "hardcoded-password",
+      "cwe_id": null,
+      "cve_id": null
+    },
+    {
+      "issue_number": 2,
+      "issue_name": "Hardcoded token detected",
+      "scanner_name": "Gitleaks",
+      "severity": "UNKNOWN",
+      "affected_filename": "dev-config.conf",
+      "start_line": 1,
+      "end_line": 1,
+      "rule_id": "hardcoded-token",
+      "cwe_id": null,
+      "cve_id": null
+    },
+    {
+      "issue_number": 3,
+      "issue_name": "Hardcoded token detected",
+      "scanner_name": "Gitleaks",
+      "severity": "UNKNOWN",
+      "affected_filename": "test_starter_kit.py",
+      "start_line": 411,
+      "end_line": 411,
+      "rule_id": "hardcoded-token",
+      "cwe_id": null,
+      "cve_id": null
+    },
+    {
+      "issue_number": 4,
+      "issue_name": "Dynamic SQL Execution",
+      "scanner_name": "Semgrep",
+      "severity": "ERROR",
+      "affected_filename": "users.sql",
+      "start_line": 8,
+      "end_line": 8,
+      "rule_id": "insecure-dynamic-sql",
+      "cwe_id": [
+        "CWE-89"
+      ],
+      "cve_id": null
+    },
+    {
+      "issue_number": 5,
+      "issue_name": "Potential SQL Injection from Query Concatenation",
+      "scanner_name": "Semgrep",
+      "severity": "ERROR",
+      "affected_filename": "Manager.java",
+      "start_line": 10,
+      "end_line": 10,
+      "rule_id": "java-sql-injection",
+      "cwe_id": [
+        "CWE-89"
+      ],
+      "cve_id": null
+    },
+    {
+      "issue_number": 6,
+      "issue_name": "Vulnerable Log4j Dependency",
+      "scanner_name": "Semgrep",
+      "severity": "ERROR",
+      "affected_filename": "pom.xml",
+      "start_line": 11,
+      "end_line": 12,
+      "rule_id": "vulnerable-log4j",
+      "cwe_id": null,
+      "cve_id": [
+        "CVE-2021-44228"
+      ]
+    },
+    {
+      "issue_number": 9,
+      "issue_name": "Vulnerable Java dependency \u2014 CVE-2015-6420 \u2014 commons-collections:commons-collections",
+      "scanner_name": "OWASP Dependency-Check",
+      "severity": "CRITICAL",
+      "affected_filename": "commons-collections-3.2.1.jar",
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "CVE-2015-6420",
+      "cwe_id": [
+        "CWE-502"
+      ],
+      "cve_id": [
+        "CVE-2015-6420"
+      ]
+    },
+    {
+      "issue_number": 10,
+      "issue_name": "Vulnerable Java dependency \u2014 CVE-2018-1000873 \u2014 com.fasterxml.jackson.core:jackson-annotations",
+      "scanner_name": "OWASP Dependency-Check",
+      "severity": "MEDIUM",
+      "affected_filename": "jackson-annotations-2.9.0.jar",
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "CVE-2018-1000873",
+      "cwe_id": [
+        "CWE-20"
+      ],
+      "cve_id": [
+        "CVE-2018-1000873"
+      ]
+    },
+    {
+      "issue_number": 11,
+      "issue_name": "Vulnerable Java dependency \u2014 CVE-2019-14379 \u2014 com.fasterxml.jackson.core:jackson-databind",
+      "scanner_name": "OWASP Dependency-Check",
+      "severity": "CRITICAL",
+      "affected_filename": "jackson-databind-2.9.8.jar",
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "CVE-2019-14379",
+      "cwe_id": [
+        "CWE-1321"
+      ],
+      "cve_id": [
+        "CVE-2019-14379"
+      ]
+    },
+    {
+      "issue_number": 79,
+      "issue_name": "Vulnerable package \u2014 GHSA-jfh8-c2jp-5v3q \u2014 log4j-core",
+      "scanner_name": "Grype",
+      "severity": "CRITICAL",
+      "affected_filename": null,
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "GHSA-jfh8-c2jp-5v3q",
+      "cwe_id": null,
+      "cve_id": [
+        "CVE-2021-44228"
+      ]
+    },
+    {
+      "issue_number": 80,
+      "issue_name": "Vulnerable package \u2014 GHSA-jfh8-c2jp-5v3q \u2014 log4j-core",
+      "scanner_name": "Grype",
+      "severity": "CRITICAL",
+      "affected_filename": null,
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "GHSA-jfh8-c2jp-5v3q",
+      "cwe_id": null,
+      "cve_id": [
+        "CVE-2021-44228"
+      ]
+    },
+    {
+      "issue_number": 81,
+      "issue_name": "Vulnerable package \u2014 GHSA-jfh8-c2jp-5v3q \u2014 log4j-core",
+      "scanner_name": "Grype",
+      "severity": "CRITICAL",
+      "affected_filename": null,
+      "start_line": null,
+      "end_line": null,
+      "rule_id": "GHSA-jfh8-c2jp-5v3q",
+      "cwe_id": null,
+      "cve_id": [
+        "CVE-2021-44228"
+      ]
+    },
+    {
+      "issue_number": 411,
+      "issue_name": "Ensure every security group and rule has a description",
+      "scanner_name": "Checkov",
+      "severity": "UNKNOWN",
+      "affected_filename": "main.tf",
+      "start_line": 5,
+      "end_line": 29,
+      "rule_id": "CKV_AWS_23",
+      "cwe_id": null,
+      "cve_id": null
+    },
+    {
+      "issue_number": 412,
+      "issue_name": "Ensure no security groups allow egress from 0.0.0.0:0 to port -1",
+      "scanner_name": "Checkov",
+      "severity": "UNKNOWN",
+      "affected_filename": "main.tf",
+      "start_line": 5,
+      "end_line": 29,
+      "rule_id": "CKV_AWS_382",
+      "cwe_id": null,
+      "cve_id": null
+    },
+    {
+      "issue_number": 413,
+      "issue_name": "Ensure no security groups allow ingress from 0.0.0.0:0 to port 22",
+      "scanner_name": "Checkov",
+      "severity": "UNKNOWN",
+      "affected_filename": "main.tf",
+      "start_line": 5,
+      "end_line": 29,
+      "rule_id": "CKV_AWS_24",
+      "cwe_id": null,
+      "cve_id": null
+    }
+  ]
+}
