@@ -126,6 +126,13 @@ def linux_family():
     return None
 
 
+def is_ubuntu():
+    try:
+        return platform.freedesktop_os_release().get("ID") == "ubuntu"
+    except OSError:
+        return False
+
+
 def package_command(system, name, lookup=shutil.which, *, family=None):
     if system == "windows" and lookup("winget"):
         ids = {"git": "Git.Git", "java": "EclipseAdoptium.Temurin.21.JDK", "docker": "Docker.DockerDesktop"}
@@ -180,6 +187,45 @@ class Installer:
     def __init__(self, system, arch, cache, allow, log):
         self.system, self.arch, self.cache, self.allow, self.log = system, arch, cache, allow, log
         self.records = {}
+        self.apt_refreshed = False
+
+    def install_system_package(self, name):
+        if self.system != "linux" or name not in {"git", "java", "pip"} or not is_ubuntu():
+            timeout = 3600 if name == "pip" else 1800
+            run(package_command(self.system, name), log=self.log, timeout=timeout)
+            return
+
+        try:
+            python = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            package = {"git": "git", "java": "default-jdk", "pip": f"{python}-venv"}[name]
+            if not shutil.which("apt-get"):
+                raise RuntimeError(f"Ubuntu requires APT to install {package}. Contact your administrator.")
+            apt = ["apt-get"]
+            if os.geteuid() != 0:
+                if not shutil.which("sudo"):
+                    raise PermissionError(f"Ubuntu requires authorized sudo to install {package}. "
+                                          "Contact your administrator.")
+                apt.insert(0, "sudo")
+            command = [*apt, "install", "-y", package]
+            print(f"Ubuntu APT: installing {package}.", file=sys.stderr, flush=True)
+
+            def apt_status(args):
+                return subprocess.run(args, stdout=self.log, stderr=subprocess.STDOUT, timeout=1800).returncode
+
+            status = apt_status(command)
+            # APT reports package errors as 100. A sudo denial should stop immediately.
+            if status == 100 and not self.apt_refreshed:
+                print("Ubuntu APT: refreshing package indexes after installation failed, then retrying.",
+                      file=sys.stderr, flush=True)
+                if apt_status([*apt, "update"]) == 0:
+                    self.apt_refreshed = True
+                    status = apt_status(command)
+            if status:
+                raise RuntimeError(f"Ubuntu APT could not install {package}. Check APT sources and "
+                                   "authorized privileges, or contact your administrator. See run.log.")
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            print(error, file=sys.stderr, flush=True)
+            raise
 
     def version(self, name, cmd, cwd=None):
         flag = {"gitleaks": "version", "syft": "version", "grype": "version"}.get(name, "--version")
@@ -261,11 +307,15 @@ class Installer:
             self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.install_archive(name)
         else:
-            run(package_command(self.system, name), log=self.log, timeout=1800)
+            self.install_system_package(name)
             refresh_windows_path()
             if self.system == "macos" and name == "java":
                 home = run(["/usr/libexec/java_home", "-v", "21"], capture=True, timeout=30).strip()
                 return [str(Path(home) / "bin/java")]
+            if self.system == "linux" and name == "java" and is_ubuntu():
+                java = Path("/usr/lib/jvm/default-java/bin/java")
+                if java.is_file():
+                    return [str(java)]
             path = shutil.which(name)
             if path:
                 return [path]
@@ -283,7 +333,7 @@ class Installer:
         except RuntimeError:
             if self.system != "linux":
                 raise
-            run(package_command(self.system, "pip"), log=self.log)
+            self.install_system_package("pip")
             run([sys.executable, "-m", "venv", base], log=self.log)
         python = base / ("Scripts/python.exe" if self.system == "windows" else "bin/python")
         pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)

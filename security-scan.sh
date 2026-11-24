@@ -61,6 +61,31 @@ linux_identity() {
   printf '%s\n' "$id $family"
 }
 
+ubuntu_install_python() {
+  local -a apt=(apt-get)
+  local status
+  if ! command -v apt-get >/dev/null; then
+    printf 'Ubuntu requires APT to install python3 and python3-venv. Contact your administrator.\n' >&2
+    return 1
+  fi
+  if [[ $EUID != 0 ]]; then
+    if ! command -v sudo >/dev/null; then
+      printf 'Ubuntu requires authorized sudo to install python3 and python3-venv. Contact your administrator.\n' >&2
+      return 1
+    fi
+    apt=(sudo apt-get)
+  fi
+  printf 'Ubuntu APT: installing python3 and python3-venv.\n' >&2
+  "${apt[@]}" install -y python3 python3-venv >&2 && return 0
+  status=$?
+  if [[ $status == 100 ]]; then
+    printf 'Ubuntu APT: refreshing package indexes after installation failed, then retrying.\n' >&2
+    "${apt[@]}" update >&2 && "${apt[@]}" install -y python3 python3-venv >&2 && return 0
+  fi
+  printf 'Ubuntu APT could not install python3 and python3-venv. Check APT sources and authorized privileges, or contact your administrator.\n' >&2
+  return 1
+}
+
 dry=false
 install=true
 for arg in "$@"; do
@@ -83,11 +108,12 @@ if ! find_python; then
     windows) installer=(winget install --exact --id Python.Python.3.12 --source winget --scope user --disable-interactivity) ;;
     macos) installer=(brew install python@3.12) ;;
     linux)
-      if [[ $EUID != 0 ]]; then
+      if [[ $(linux_identity) == ubuntu\ * ]]; then
+        installer=(ubuntu_install_python)
+      elif [[ $EUID != 0 ]]; then
         printf 'Python 3.10+ requires an approved installation on Linux. This kit does not invoke sudo.\n' >&2
         exit 2
-      fi
-      if command -v apt-get >/dev/null; then
+      elif command -v apt-get >/dev/null; then
         installer=(apt-get install -y python3 python3-venv)
       else
         manager=
