@@ -218,6 +218,14 @@ def resolve_dependencies(project, builds, out, log):
                     KIT / "accidion-dependencies.gradle", f"-PaccidionDependencyDirectory={target}",
                     "accidionCollectDependencies"]
         run(args, cwd=root, log=log)
+        if family == "maven":
+            tree_file = target / "maven-dependency-tree.json"
+            tree_args = [
+                *tool, "-B", "-f", root / "pom.xml",
+                "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree",
+                "-DoutputType=json", f"-DoutputFile={tree_file}",
+            ]
+            run(tree_args, cwd=root, log=log)
 
 
 def args_for(argv=None):
@@ -489,6 +497,12 @@ def execute(options, system, arch):
                 resolved_dependencies = True
                 try:
                     resolve_dependencies(project, builds, deps, log)
+                    for index, (family, root, tool) in enumerate(builds):
+                        if family == "maven":
+                            tree_file = deps / str(index) / "maven-dependency-tree.json"
+                            if tree_file.is_file():
+                                destination = report_dir / f"maven-dependency-tree-{index}.json"
+                                shutil.copy2(tree_file, destination)
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                     resolution_error = str(error)
 
