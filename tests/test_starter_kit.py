@@ -581,24 +581,16 @@ class BootstrapTests(unittest.TestCase):
                     "MOCK_ARCHIVE": self.posix(archive), "MOCK_BOOTSTRAP": self.posix(self.bootstrap),
                     "TMPDIR": self.posix(self.root), "MOCK_KIT": self.posix(kit.KIT),
                     "MOCK_ORIGIN": f"git@github.com:{self.repo}.git", "MOCK_REPO": self.repo}
-        guide = (kit.KIT / "README.md").read_text(encoding="utf-8")
-        block = next(part for part in guide.split("~~~bash\n") if part.startswith("bash -s -- OWNER/PRIVATE_REPO"))
-        pins = "OWNER/PRIVATE_REPO FULL_COMMIT_SHA BOOTSTRAP_SHA256 KIT_ARCHIVE_SHA256"
-        self.command = block.split("\n~~~", 1)[0].replace(
-            pins, f"{self.repo} {self.pin} {self.bootstrap_sha} {self.archive_sha} --dry-run", 1
-        )
-        release = next(part for part in guide.split("~~~bash\n")
-                       if part.startswith("bash -c") and "--release-asset" in part.split("\n~~~", 1)[0])
-        self.release_command = release.split("\n~~~", 1)[0].replace(
-            pins,
-            f"{self.repo} {self.pin} {self.bootstrap_sha} {self.archive_sha} --dry-run", 1,
-        )
-        public = next(part for part in guide.split("~~~bash\n")
-                      if part.startswith("bash -c") and "--public --commit" in part.split("\n~~~", 1)[0])
-        self.public_command = public.split("\n~~~", 1)[0].replace(
-            "FULL_COMMIT_SHA BOOTSTRAP_SHA256 KIT_ARCHIVE_SHA256",
-            f"{self.pin} {self.bootstrap_sha} {self.archive_sha} --dry-run", 1,
-        )
+        commands = Path(__file__).resolve().parent / "fixtures" / "bootstrap"
+        pins = "FULL_COMMIT_SHA BOOTSTRAP_SHA256 KIT_ARCHIVE_SHA256"
+        values = f"{self.pin} {self.bootstrap_sha} {self.archive_sha} --dry-run"
+
+        def load_command(filename, placeholders, arguments):
+            return (commands / filename).read_text(encoding="utf-8").replace(placeholders, arguments, 1)
+
+        self.command = load_command("private-archive.sh", f"OWNER/PRIVATE_REPO {pins}", f"{self.repo} {values}")
+        self.release_command = load_command("private-release.sh", f"OWNER/PRIVATE_REPO {pins}", f"{self.repo} {values}")
+        self.public_command = load_command("public-archive.sh", pins, values)
 
     @staticmethod
     def posix(path):
