@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree
@@ -313,6 +314,7 @@ def execute(options, system, arch):
 
     report_dir = private_run_path(application_reports)
     started = datetime.now(timezone.utc)
+    scan_clock = time.monotonic()
     redactor = Redactor()
     statuses = {}
     issues = []
@@ -366,6 +368,7 @@ def execute(options, system, arch):
         log.flush()
 
         def execute_scan(name, action, skip=None):
+            scan_started = time.monotonic()
             label = NAMES.get(name, "Syft")
             installation = installer.records[name]
             entry = {"status": "skipped", "reason": skip, "report": None,
@@ -377,10 +380,12 @@ def execute(options, system, arch):
                     str(path.relative_to(project)) for path in files["opentofu"]
                 ]
             if skip:
+                entry["durationSeconds"] = round(time.monotonic() - scan_started, 2)
                 print(f"{label}: skipped ({skip})", flush=True)
                 return
             if not tools[name]:
-                entry.update(status="failed", reason=installation.get("reason"))
+                entry.update(status="failed", reason=installation.get("reason"),
+                             durationSeconds=round(time.monotonic() - scan_started, 2))
                 print(f"{label}: failed to provide a compatible executable", flush=True)
                 return
             raw_output = work / REPORTS[name]
@@ -440,10 +445,28 @@ def execute(options, system, arch):
                     problems.append(f"Native findings ({entry['nativeFindingCount']}) differ from normalized "
                                     f"findings ({entry['findingCount']}); inspect the individual report")
             entry.update(status="failed" if problems else "success",
-                         reason=redactor.text("; ".join(problems)) if problems else None)
+                         reason=redactor.text("; ".join(problems)) if problems else None,
+                         durationSeconds=round(time.monotonic() - scan_started, 2))
             if name == "syft":
                 inventory = entry.get("inventoryCount", "unavailable")
                 print(f"{label}: {entry['status']} | SBOM components: {inventory}", flush=True)
+                if entry["status"] == "success":
+                    for index, component in enumerate(report.get("components", []), 1):
+                        licenses = []
+                        for item in component.get("licenses") or []:
+                            license_data = item.get("license") or item.get("expression") or {}
+                            if isinstance(license_data, dict):
+                                licenses.append(license_data.get("id") or license_data.get("name"))
+                            elif isinstance(license_data, str):
+                                licenses.append(license_data)
+                        locations = [item.get("path") for item in component.get("evidence", {}).get("occurrences", [])
+                                     if isinstance(item, dict) and item.get("path")]
+                        print(f"SBOM Component {index}: {component.get('name') or 'unknown'} | "
+                              f"Version: {component.get('version') or 'unknown'} | "
+                              f"Type: {component.get('type') or 'unknown'} | "
+                              f"PURL: {component.get('purl') or 'unavailable'} | "
+                              f"Licenses: {', '.join(filter(None, licenses)) or 'unavailable'} | "
+                              f"Locations: {', '.join(locations) or 'unavailable'}", flush=True)
             else:
                 print(f"{label}: {entry['status']} | {len(entry['findings'])} issues", flush=True)
             log.flush()
@@ -590,7 +613,9 @@ def execute(options, system, arch):
         (report_dir / "run.log").write_text(redactor.text(log.read()), encoding="utf-8")
 
     summary = {"schemaVersion": 2, "applicationName": app_name, "scanStartedAt": started.isoformat(),
-               "generatedAt": datetime.now(timezone.utc).isoformat(), "platform": system, "architecture": arch,
+               "generatedAt": datetime.now(timezone.utc).isoformat(),
+               "durationSeconds": round(time.monotonic() - scan_clock, 2),
+               "platform": system, "architecture": arch,
                "kitCommit": os.environ.get("ACCIDION_KIT_COMMIT"),
                "kitArchiveSha256": os.environ.get("ACCIDION_KIT_ARCHIVE_SHA256"),
                "project": str(project), "mode": "setup-only" if options.setup_only else "scan",
