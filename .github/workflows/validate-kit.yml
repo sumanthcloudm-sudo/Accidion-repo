@@ -1,0 +1,36 @@
+name: Validate Accidion Starter Kit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Python and launcher validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate Python syntax
+        run: python -m py_compile starter_kit.py starter_install.py starter_findings.py
+
+      - name: Validate Bash launcher syntax
+        run: bash -n security-scan.sh
+
+      - name: Validate launcher help
+        run: bash security-scan.sh --help
+
+      - name: Validate dry-run discovery
+        run: bash security-scan.sh --dry-run --project-path .
