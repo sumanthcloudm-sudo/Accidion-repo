@@ -150,7 +150,8 @@ def new_issue(scanner, **evidence):
         "source_file", "affected_filename", "relative_file_path",
         "start_line", "end_line", "issue_description", "root_cause", "security_impact",
         "recommended_remediation", "rule_id", "cwe_id", "cve_id", "affected_dependency",
-        "installed_version", "fixed_version", "reference_links",
+        "installed_version", "fixed_version", "maven_coordinate", "dependency_type",
+        "parent_dependency", "parent_version", "dependency_chains", "reference_links",
     ))
     issue.update(scanner_name=NAMES[scanner], **evidence)
     if source := issue["source_file"]:
@@ -256,6 +257,11 @@ def grype_issues(report, _project):
         identifier, component = first_text(vuln.get("id")), first_text(artifact.get("name"))
         label = " — ".join(filter(None, (identifier, component)))
         versions = (vuln.get("fix") or {}).get("versions") or []
+        metadata = artifact.get("metadata") or {}
+        group_id = first_text(metadata.get("pomGroupID"))
+        artifact_id = first_text(metadata.get("pomArtifactID"), component)
+        installed = first_text(artifact.get("version"))
+        maven_coordinate = f"{group_id}:{artifact_id}:{installed}" if group_id and artifact_id and installed else None
         remediation = (f"Upgrade to a compatible reported fix ({', '.join(versions)}), then rebuild and rescan."
                        if versions else "Review the advisory for a patch. If none is available, evaluate a supported replacement or mitigation.")
         yield new_issue("grype", issue_name=first_text(vuln.get("title")) or f"Vulnerable package{f' — {label}' if label else ''}",
@@ -263,7 +269,7 @@ def grype_issues(report, _project):
                         issue_description=first_text(vuln.get("description")), recommended_remediation=remediation,
                         rule_id=identifier, cwe_id=identifiers(CWE, vuln.get("cwes")) or None,
                         cve_id=identifiers(CVE, [identifier, *(entry.get("id") for entry in row.get("relatedVulnerabilities") or [])]) or None,
-                        affected_dependency=component, installed_version=first_text(artifact.get("version")),
+                        affected_dependency=component, installed_version=installed, maven_coordinate=maven_coordinate,
                         fixed_version=versions or None, reference_links=references(vuln.get("urls"), vuln.get("dataSource")))
 
 
