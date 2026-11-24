@@ -1,320 +1,201 @@
-# Accidion DevSecOps Starter Kit
+# Accidion — Java Application Security Scanner
 
-## Overview
+Accidion scans a completed Java application and creates JSON security reports. It is intended to help developers find security issues before a pull request or release.
 
-Accidion is an automated security scanning toolkit designed
-for developers who have completed their Java applications.
+**Target environment: Ubuntu Linux.** These instructions cover Ubuntu only. Windows, macOS and other Linux distributions are outside the documented workflow.
 
-It automatically installs or reuses compatible security tools,
-executes applicable security scans sequentially, and generates
-detailed JSON security reports.
+## What you need
 
-Developers do not need to manually configure each scanner.
+Before running Accidion, make sure you have:
 
-## Supported Operating Systems
+- Ubuntu with Bash.
+- Git.
+- Python 3.10 or newer, including the matching `venv` support.
+- A JDK compatible with your application. OWASP Dependency-Check requires Java 11 or newer.
+- Internet access to approved package repositories and vulnerability databases.
+- Permission to read your application and write to your home directory.
 
-- Windows 10/11 using Git Bash
-- Ubuntu and other supported Linux distributions
-- macOS Intel and Apple Silicon
-- Windows Subsystem for Linux (WSL)
+Your Java application should already build and pass its normal tests.
 
-Native macOS and standalone Linux end-to-end validation
-is pending.
+### Why these prerequisites matter
 
-## Prerequisites
+| Requirement | Why Accidion needs it |
+| --- | --- |
+| Bash | Runs the `security-scan.sh` launcher |
+| Git | Clones the toolkit |
+| Python 3.10+ and venv | Runs the scanner orchestration and creates its isolated tool environment |
+| JDK | Supports Java dependency analysis and Java build tools |
+| Network access | Downloads approved scanner packages and vulnerability databases |
+| Writable home directory | Stores tools, caches and private JSON reports |
 
-- Git
-- Bash
-- Approved internet access
-- Writable home directory
-- Python 3.10 or newer (Python 3.12 recommended)
-- Compatible Java JDK
-- Maven or Gradle, depending on the application
-- Docker, only for optional container image scanning
+Accidion does **not** run `sudo` or bypass Ubuntu permissions. If a system package is missing and your account cannot install it, ask your administrator to install it. Do not run the complete scan as root.
 
-The kit attempts to install missing compatible tools wherever
-system permissions and organizational policies permit.
+## Quick start
 
-## Quick Start
+### 1. Install or verify prerequisites
 
-### Step 1 - Complete Your Java Application
+Check what is already available:
 
-Develop and test your Java application using:
+```bash
+git --version
+python3 --version
+java -version
+```
 
-- IntelliJ IDEA
-- Eclipse
-- Visual Studio Code
+If Git, Python or the matching Python virtual-environment package is missing, ask your Ubuntu administrator to install the required packages. The JDK version must also be compatible with your application; Java 11 or newer is required by Dependency-Check.
 
-Ensure the application builds successfully before scanning.
-
-### Step 2 - Clone Accidion Repository
-
-Open Git Bash on Windows or Bash on Linux/macOS.
-
-Clone the security kit once:
+### 2. Clone Accidion once
 
 ```bash
 mkdir -p "$HOME/devsecops"
 git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
 ```
 
-Keep the Accidion repository separate from your application.
+Keep the Accidion folder separate from your Java application. Use a repository revision approved by your team.
 
-Use an organization-approved repository revision.
+### 3. Open your Java application folder
 
-### Step 3 - Navigate to Your Java Application
+Replace the example path with the real path to your application:
 
 ```bash
 cd "$HOME/projects/my-java-app"
 ```
 
-Replace the example path with your actual application path.
+Run the scan from the application root so Accidion can discover its source files and build files.
 
-Windows Git Bash example:
-
-```bash
-cd "/c/Users/YOUR_USERNAME/projects/my-java-app"
-```
-
-### Step 4 - Execute One Security Scan Command
+### 4. Run the scan
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
 ```
 
-This single command automatically:
+That is the normal developer command. Accidion discovers the project, checks applicable tools, installs or reuses compatible tools where permitted, runs the scans sequentially and writes JSON reports.
 
-1. Detects the operating system and architecture.
-2. Discovers Java application files and dependencies.
-3. Checks required security tools.
-4. Installs missing compatible tools where permitted.
-5. Reuses existing compatible installations.
-6. Executes applicable security scanners sequentially.
-7. Displays security findings in the terminal.
-8. Generates individual JSON security reports.
-9. Generates a consolidated security summary.
+If you want to stay in another directory, pass the application path explicitly:
 
-## Security Scanning Tools
-
-| Order | Security Tool | Purpose |
-| --- | --- | --- |
-| 1 | Gitleaks | Secret and credential scanning |
-| 2 | Semgrep | Static application security testing |
-| 3 | OWASP Dependency-Check | Java dependency vulnerability scanning |
-| 4 | Syft | Software Bill of Materials generation |
-| 5 | Grype | Package and optional container vulnerability scanning |
-| 6 | Checkov | Infrastructure as Code security scanning |
-
-Syft generates component inventory rather than vulnerability findings.
-
-## Security Scanning Workflow
-
-```mermaid
-flowchart TD
-    A[Completed Java Application] --> B[Execute security-scan.sh]
-    B --> C[Detect Application and Environment]
-    C --> D[Install or Reuse Security Tools]
-    D --> E[Gitleaks Secret Scanning]
-    E --> F[Semgrep Static Code Scanning]
-    F --> G[OWASP Dependency-Check]
-    G --> H[Syft SBOM Generation]
-    H --> I[Grype Vulnerability Scanning]
-    I --> J[Checkov Infrastructure Scanning]
-    J --> K[Generate JSON Security Reports]
-    K --> L[Review Findings and Fix Issues]
-    L --> M[Rescan Application]
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --project-path "$HOME/projects/my-java-app"
 ```
 
-Individual scanners may be skipped or fail depending on
-application contents, prerequisites, permissions and network access.
+## What gets scanned
 
-## Security Reports
+| Tool | What it checks | When it applies |
+| --- | --- | --- |
+| Gitleaks | Exposed secrets and credentials | Every scan |
+| Semgrep | Source-code security patterns | When Java application inputs are found |
+| OWASP Dependency-Check | Known vulnerabilities in Java dependencies | When Maven/Gradle build files or Java archives are found |
+| Syft | Software component inventory (SBOM) | When Java application inputs are found |
+| Grype | Known vulnerabilities in the generated SBOM; optional container image scan | When an SBOM or selected image is available |
+| Checkov | Infrastructure-as-Code and Dockerfile configuration | When supported infrastructure files or Dockerfiles are found |
 
-Reports are generated outside the application directory.
+A scanner may be skipped when the application does not contain its supported input. A skipped scanner is not a successful scan. Review the scan summary and any failed or skipped scanner status.
 
-Default report location:
+## Where reports are saved
+
+By default, reports are written outside your application:
 
 ```text
-$HOME/.accidion/reports/<application-name>/<scan-directory>/
+$HOME/.accidion/reports/<application-name>/<scan-run>/
 ```
 
-The terminal displays the exact report directory after execution.
+The terminal prints the exact directory for each run.
 
-| Report File | Description |
-| --- | --- |
-| security-summary.json | Consolidated security findings |
-| gitleaks-report.json | Secret and credential findings |
-| semgrep-report.json | Source code security findings |
-| dependency-check-report.json | Java dependency vulnerabilities |
-| syft-sbom.json | Software component inventory |
-| grype-report.json | Package or container vulnerabilities |
-| checkov-report.json | Infrastructure security findings |
-| run.log | Execution and troubleshooting diagnostics |
+Important JSON files include:
 
-Individual reports are generated when scanner output is available.
+- `security-summary.json` — consolidated findings from the available scanners.
+- `gitleaks-report.json` — secret scan results.
+- `semgrep-report.json` — source-code scan results.
+- `dependency-check-report.json` — Java dependency vulnerability results.
+- `syft-sbom.json` — software component inventory.
+- `grype-report.json` — package or image vulnerability results.
+- `checkov-report.json` — infrastructure scan results.
 
-## Security Finding Details
+Some individual reports are created only when the corresponding scanner runs and produces output. A run log is also kept in the run directory for troubleshooting.
 
-The consolidated security summary includes available information:
+Reports can contain sensitive project and vulnerability information. Keep them in approved, access-controlled storage and do not commit them to your application repository.
 
-- Issue number
-- Issue name
-- Security scanner name
-- Vulnerability category
-- Severity
-- Affected filename
-- Relative file path
-- Start and end line numbers
-- Issue description
-- Root cause
-- Security impact
-- Recommended remediation
-- CWE and CVE identifiers
-- Affected dependency
-- Installed version
-- Fixed version
-- Reference links
+## Understand and fix findings
 
-Unavailable information is reported as null or UNKNOWN.
+1. Open `security-summary.json` from the report directory printed in the terminal.
+2. Find the issue name, scanner, severity, source file and line number, when available.
+3. Open the affected file in your editor and verify the finding.
+4. Apply the recommended fix and check related code or dependencies.
+5. Build and test your application again.
+6. Run the same Accidion command again and review the new summary.
 
-## Example Security Finding
+Not every scanner provides a source line number. Dependency and inventory findings may identify a package rather than a line of code. A severity of `UNKNOWN` still needs review.
 
-The following is an illustrative Semgrep finding:
+**A successful scan does not mean that the application has zero vulnerabilities.** Review findings and scanner failures before accepting the result.
 
-```json
-{
-  "issue_number": 1,
-  "issue_name": "Potential SQL Injection from Query Concatenation",
-  "scanner_name": "Semgrep",
-  "severity": "ERROR",
-  "source_file": "src/main/java/com/example/App.java",
-  "affected_filename": "App.java",
-  "start_line": 25,
-  "end_line": 25,
-  "recommended_remediation": "Use parameterized queries with bound values."
-}
-```
+## Optional commands
 
-Actual findings depend on the application and scanner results.
+Run these from your Java application directory.
 
-## Fix Security Issues and Rescan
-
-1. Open security-summary.json.
-2. Identify the security issue.
-3. Open the affected application file.
-4. Navigate to the reported line number, when available.
-5. Review and apply the recommended remediation.
-6. Build and test the application.
-7. Execute the security scan again.
-
-```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
-```
-
-Compare the latest findings with the previous scan.
-
-## Optional Advanced Commands
-
-These commands are optional and are not required
-for normal developer scanning.
-
-Preview application discovery without scanning:
+Preview which files and scanners Accidion detects, without installing tools or writing reports:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --dry-run
 ```
 
-Install or verify scanners without scanning:
+Verify or install the toolkit's scanners without running scans:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --setup-only
 ```
 
-Scan without kit-managed installation:
+Use already-installed tools and disable kit-managed installation:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --no-install
 ```
 
-The --dry-run and --setup-only modes are mutually exclusive. The --no-install option can be combined with either mode.
+The launcher also supports `--report-dir PATH` to choose a private report parent outside the application.
 
-## Optional Container Image Scanning
+## Optional Docker image scan
 
-Scan an existing Docker image:
+Docker is not required for the normal source and dependency scan. For an existing local image:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --image my-app:latest
 ```
 
-Build and scan a Docker image:
+To build and scan a discovered Dockerfile:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --build-image
 ```
 
-Docker must be running with approved access.
+Docker must be installed, running and accessible to your account. Image scanning is an additional check; it does not replace source-code or dependency scanning.
 
 ## Troubleshooting
 
-| Problem | Recommended Action |
+| Message or symptom | What to check |
 | --- | --- |
-| Python unavailable | Install approved Python or contact IT |
-| Java build failure | Check JDK, Maven or Gradle configuration |
-| Scanner installation blocked | Contact IT for approved installation |
-| Database download failure | Check network, proxy and firewall settings |
-| Docker unavailable | Start the approved Docker service |
-| Checkov skipped | Verify supported infrastructure files exist |
-| Report generation failure | Check directory permissions |
+| Python 3.10+ is required | Install a supported Python version and its matching `venv` package |
+| Permission or package installation failure | Ask your Ubuntu administrator to provision the missing prerequisite; do not run the full scan as root |
+| Java or build-tool failure | Check the JDK version, project wrapper and application build |
+| Dependency scan finds no dependencies | Confirm the project contains a supported Maven/Gradle build file or Java archive and that dependency resolution succeeds |
+| Vulnerability database download fails | Check approved network, proxy and firewall access |
+| Scanner is skipped | Check whether the application contains files supported by that scanner |
+| Report cannot be written | Check home-directory permissions and available disk space |
+| Docker scan fails | Check Docker installation, daemon status, image name and account access |
 
-The first scan may take longer because security tools,
-application dependencies and vulnerability databases
-may need to be downloaded.
+The first run may take longer because tools, application dependencies and vulnerability databases may need to be downloaded. Later runs can reuse compatible tools and cached data.
 
-Subsequent scans can reuse compatible tools and caches.
+## Scope and limitations
 
-## Important Notes
+- The documented developer workflow targets Ubuntu.
+- Accidion does not automatically modify or repair application source code.
+- Scanner coverage depends on the files discovered and the scanner's supported formats.
+- Tool installation and database updates depend on approved network access and permissions.
+- Maven dependency-tree information may be available when dependency resolution succeeds; it does not by itself prove runtime exploitability or provide complete direct/transitive source-line mapping.
+- Review failed and skipped scanners as well as findings. Do not treat missing output as a clean result.
 
-- Run the security kit only against trusted applications.
-- The kit does not bypass organizational security controls.
-- The kit does not automatically modify application source code.
-- Dependency findings may not contain source line numbers.
-- Default Grype scanning uses the SBOM.
-- Container image scanning requires explicit selection.
-- Review failed and skipped scanners before accepting scan coverage.
-- Successful execution does not mean zero vulnerabilities.
-- Treat generated security reports as sensitive information.
+## More information
 
-## Enhanced Security Reporting
+- [Developer Guide](DEVELOPER-GUIDE.md) — detailed workflow, security rules, scanner behavior and troubleshooting.
+- [Sample Reports](sample-reports/README.md) — examples of report output.
 
-The toolkit provides enhanced dependency and inventory details when matching scanner evidence is available:
+---
 
-- Maven dependency tree collection during dependency resolution.
-- Maven coordinates in Grype findings when the scanner supplies Maven artifact metadata.
-- Maven dependency tree JSON report when dependency resolution and tree generation succeed.
-- Direct/transitive classification, parent-chain correlation and verified POM line mapping are not yet included in normalized findings.
-- Scanner-provided remediation guidance and fixed-version information where available.
-- Individual SBOM component details.
-- Available tool installation and scanner execution durations, plus total scan duration.
-
-Developers do not need to run a separate Maven dependency-tree command. These details depend on successful dependency resolution and available scanner evidence. Maven dependency-chain enrichment is not equivalent to runtime exploitability analysis; equivalent Gradle chain enrichment is not currently documented as implemented.
-
-## Ubuntu Installation Notes
-
-The launcher does not invoke sudo. Python 3.10+, matching virtual-environment support, Git and a compatible JDK may require administrator-approved installation. If prerequisites cannot be installed under the developer account, contact the authorized administrator. Fresh Ubuntu and external Java application end-to-end validation remain pending.
-
-## Additional Documentation
-
-- [Developer Guide](DEVELOPER-GUIDE.md)
-- [Sample Security Reports](sample-reports/README.md)
-
-## Developer Quick Reference
-
-Clone once, navigate to your completed Java application,
-and execute:
-
-```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
-```
-
-One scan command. Automatic tool setup where permitted.
-Sequential security scanning. Detailed JSON findings.
+**Normal workflow:** build and test your Java application → run one Accidion command → review the JSON summary → fix issues → build, test and scan again.
