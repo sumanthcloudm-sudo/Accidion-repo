@@ -432,15 +432,41 @@ def execute(options, system, arch):
             def dependency_check(cmd, out):
                 if not java:
                     raise RuntimeError("A compatible JDK is unavailable")
+
                 prepare_dependencies()
+
                 if resolution_error:
-                    raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
-                database = vulnerability_cache("dependency-check", home / "dependency-check-data")
-                args = ["--project", project.name, "--format", "JSON", "--out", out.parent,
-                        "--data", database, "--scan", deps]
+                    raise RuntimeError(
+                        f"Dependency resolution failed: {resolution_error}"
+                    )
+
+                database = vulnerability_cache(
+                    "dependency-check",
+                    home / "dependency-check-data"
+                )
+
+                args = [
+                    "--project", project.name,
+                    "--format", "JSON",
+                    "--out", out.parent,
+                    "--data", database,
+                    "--scan", deps,
+                    "--disableOssIndex"
+                ]
+
                 for artifact in files["jars"]:
                     args.extend(("--scan", artifact))
+
                 invoke(cmd, *args)
+
+                report = json.loads(
+                    out.read_text(encoding="utf-8")
+                )
+
+                if not report.get("dependencies"):
+                    raise RuntimeError(
+                        "Dependency-Check detected no dependencies."
+                    )
 
             def syft(cmd, out):
                 # Inventory the resolved dependencies independently of the original project
