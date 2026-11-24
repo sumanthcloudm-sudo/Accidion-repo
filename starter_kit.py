@@ -225,7 +225,11 @@ def resolve_dependencies(project, builds, out, log):
                 "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree",
                 "-DoutputType=json", f"-DoutputFile={tree_file}",
             ]
-            run(tree_args, cwd=root, log=log)
+            try:
+                run(tree_args, cwd=root, log=log)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                print(f"WARNING: Maven dependency tree report unavailable for "
+                      f"{root.relative_to(project)}: {error}", file=log, flush=True)
 
 
 def args_for(argv=None):
