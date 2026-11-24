@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -205,6 +206,7 @@ class Installer:
         return match[1]
 
     def ensure(self, name, wrapper=None, cwd=None):
+        started = time.monotonic()
         status = "unavailable"
         try:
             existing = shutil.which(name)
@@ -230,6 +232,9 @@ class Installer:
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             self.records[name] = {"status": status, "reason": str(error)}
             return None
+        finally:
+            if name in self.records:
+                self.records[name]["durationSeconds"] = round(time.monotonic() - started, 2)
 
     def managed(self, name):
         suffix = ".exe" if self.system == "windows" else ""
