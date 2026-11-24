@@ -1,7 +1,0 @@
-{
-  "demonstration": true,
-  "scanner": "Syft",
-  "reportType": "SBOM inventory summary",
-  "componentCount": 567,
-  "description": "Syft inventories software components."
-}
