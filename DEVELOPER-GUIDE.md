@@ -490,4 +490,35 @@ These requirements are proposed for approval by the organization's security and 
 
 These are developer process requirements, not automatically enforced release gates. Follow the organization's approved release and exception process.
 
+## 27. Security scan acceptance and release criteria (proposed team policy)
+
+The following criteria require approval by the organization's security and engineering owners. They are a manual review process, not an automated release gate implemented by Accidion.
+
+| Scan result | Required developer action under proposed policy |
+| --- | --- |
+| CRITICAL or HIGH | Remediate confirmed findings before release or obtain an authorized, documented risk exception |
+| MEDIUM | Assess risk and remediate or track according to approved remediation policy |
+| LOW or informational | Review and document disposition according to policy |
+| UNKNOWN or Semgrep ERROR | Investigate the evidence and assess actual risk; do not automatically map to LOW or HIGH |
+| Failed applicable scanner | Resolve the failure and rescan; escalate unresolved coverage gaps for explicit authorized review |
+| Skipped scanner | Document why it is not applicable; investigate unexpected skips |
+| Successful scanner | Review findings, coverage and available report artifacts; success does not mean zero vulnerabilities |
+
+Treat exposed valid credentials as urgent regardless of reported severity. Rotate or revoke them and follow the incident response process. Syft produces inventory rather than vulnerability findings.
+
+### Before submitting for release
+
+- [ ] Build and tests pass for the intended application revision.
+- [ ] Scan the intended revision using the approved Accidion revision and applicable scan options.
+- [ ] Review the latest security-summary.json and relevant individual JSON reports; verify applicable scan coverage.
+- [ ] Resolve scanner failures and unexpected skips, or obtain explicit authorized acceptance of unresolved coverage gaps.
+- [ ] Triage findings and resolve confirmed Critical and High risks or obtain approved exceptions; track remaining findings according to policy.
+- [ ] Rebuild, test and rescan after fixes.
+- [ ] Retain the application revision, Accidion revision, scan date, latest report location, remediation evidence and any approved exceptions in approved access-controlled storage.
+- [ ] Submit the evidence to the designated reviewer and obtain required release approval.
+
+An exception should record the affected finding or coverage gap, justification, risk, compensating controls, responsible owner, approval and expiry or review date. Developers must not approve their own exceptions unless explicitly authorized by organizational policy.
+
+Exit code 0 alone is not release approval. The designated release authority makes the final decision under approved organizational policy.
+
 For implementation details see the [README](README.md). This guide describes the public checkout workflow and its current configurations. It does not claim validation of every OS, architecture, rule, or live scan.
