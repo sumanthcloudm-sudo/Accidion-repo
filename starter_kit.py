@@ -23,7 +23,7 @@ REPORTS = {
     "grype": "grype-report.json", "checkov": "checkov-report.json",
 }
 GENERATED_JSON = (*REPORTS.values(), "grype-sbom-report.json", "security-summary.json")
-IGNORED = {".git", ".gradle", ".venv", "venv", "node_modules", ".terraform",
+IGNORED = {".accidion", ".git", ".gradle", ".venv", "venv", "node_modules", ".terraform",
            ".cache", "__pycache__", ".pytest_cache", "reports"}
 INFRA = (".tf", ".tf.json", ".bicep")
 IAC_MARKERS = re.compile(r'(?m)^\s*(?:apiVersion|AWSTemplateFormatVersion|Resources)\s*:|'
@@ -454,8 +454,8 @@ def execute(options, system, arch):
                     "--disableOssIndex"
                 ]
 
-                for artifact in files["jars"]:
-                    args.extend(("--scan", artifact))
+                for directory in sorted({artifact.parent for artifact in files["jars"]}):
+                    args.extend(("--scan", directory))
 
                 invoke(cmd, *args)
 
@@ -590,6 +590,17 @@ def execute(options, system, arch):
                "sbomComponentCount": statuses["syft"].get("inventoryCount"), "issues": issues,
                "log": str(report_dir / "run.log")}
     write_json(report_dir / "security-summary.json", redactor.data(summary))
+
+    if not options.setup_only:
+        export_dir = project / "reports"
+        export_dir.mkdir(mode=0o700, exist_ok=True)
+        for filename in GENERATED_JSON:
+            source = report_dir / filename
+            if source.is_file():
+                destination = export_dir / filename
+                shutil.copy2(source, destination)
+        print(f"Project reports: {export_dir}", flush=True)
+
     print(f"{len(issues)} issues. Report directory: {redactor.text(str(report_dir))}", flush=True)
     failures = {"unavailable", "installation_failed"}
     required = set(REPORTS) if options.setup_only else {

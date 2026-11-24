@@ -1,11 +1,16 @@
+
 title = "Accidion Gitleaks Security Rules"
 
 [extend]
 useDefault = true
 
 [allowlist]
-description = "Exclude generated Accidion scanner artifacts"
-paths = ['''(?i)(?:^|[\\/])(?:gitleaks-report|semgrep-report|dependency-check-report|syft-sbom|grype(?:-sbom)?-report|checkov-report|security-summary)\.json$''']
+description = "Exclude generated Accidion scanner artifacts and internal caches"
+paths = [
+    '''(?i)(?:^|[\\/])\.accidion[\\/]''',
+    '''(?i)(?:^|[\\/])\.git[\\/]''',
+    '''(?i)(?:^|[\\/])(?:gitleaks-report|semgrep-report|dependency-check-report|syft-sbom|grype(?:-sbom)?-report|checkov-report|security-summary)\.json$'''
+]
 
 [[rules]]
 id = "hardcoded-password"
