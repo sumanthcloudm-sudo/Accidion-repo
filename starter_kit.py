@@ -17,6 +17,8 @@ from starter_install import Installer, detect, refresh_windows_path, run
 from starter_findings import NAMES, NORMALIZE, Redactor, capture_secrets, issue_identifier
 
 KIT = Path(__file__).resolve().parent
+TOOLKIT_FILES = ("starter_kit.py", "starter_install.py", "starter_findings.py",
+                 ".gitleaks.toml", "semgrep.yml", ".checkov.yml", "accidion-dependencies.gradle")
 REPORTS = {
     "gitleaks": "gitleaks-report.json", "semgrep": "semgrep-report.json",
     "dependency-check": "dependency-check-report.json", "syft": "syft-sbom.json",
@@ -218,30 +220,63 @@ def resolve_dependencies(project, builds, out, log):
 
 
 def args_for(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-path", type=Path, default=Path.cwd())
-    parser.add_argument("--report-dir", type=Path, help="Parent report directory outside the scan target")
+    def nonempty(value):
+        if not value.strip():
+            raise argparse.ArgumentTypeError("requires a non-empty value")
+        return value
+
+    def directory_path(value):
+        return Path(nonempty(value))
+
+    parser = argparse.ArgumentParser(prog="security-scan.sh", description=__doc__,
+                                     allow_abbrev=False, add_help=False)
+    parser.add_argument("-h", "--help", action="store_true", help="Show this help message and exit")
+    parser.add_argument("--project-path", type=directory_path, default=Path.cwd(),
+                        help="Application directory (default: current directory)")
+    parser.add_argument("--report-dir", type=directory_path, help="Private report parent outside the application")
     modes = parser.add_mutually_exclusive_group()
-    modes.add_argument("--dry-run", action="store_true")
-    modes.add_argument("--setup-only", action="store_true")
-    parser.add_argument("--no-install", action="store_true")
+    modes.add_argument("--dry-run", action="store_true", help="Preview without installing tools or writing reports")
+    modes.add_argument("--setup-only", action="store_true", help="Verify or install tools without running scans")
+    parser.add_argument("--no-install", action="store_true", help="Use existing tools. Can be combined with either mode")
     images = parser.add_mutually_exclusive_group()
-    images.add_argument("--image", help="Scan a locally available Docker image")
+    images.add_argument("--image", type=nonempty, help="Scan a locally available Docker image")
     images.add_argument("--build-image", action="store_true", help="Build the discovered Dockerfile locally")
-    return parser.parse_args(argv)
+    options = parser.parse_args(argv)
+    if options.help:
+        parser.print_help()
+        parser.exit()
+    return options
+
+
+def validate_report_directory(path, label):
+    for parent in (path, *path.parents):
+        if parent.exists():
+            if not parent.is_dir():
+                raise ValueError(f"{label} must be a directory: {parent}")
+            if not os.access(parent, os.W_OK | os.X_OK):
+                raise ValueError(f"{label} requires a writable directory: {parent}")
+            return
 
 
 def execute(options, system, arch):
     os.umask(0o077)
-    project = options.project_path.resolve(strict=True)
+    for filename in TOOLKIT_FILES:
+        path = KIT / filename
+        if not path.is_file() or not os.access(path, os.R_OK):
+            raise ValueError(f"Required toolkit file is missing or unreadable: {path}. "
+                             "Restore the complete kit and retry.")
+    project = options.project_path.resolve()
     if not project.is_dir():
-        raise ValueError("Project path must be a directory")
+        raise ValueError(f"Application path must be an accessible directory: {project}")
     files = discover(project)
     roots = {family: build_roots(files, family) for family in ("maven", "gradle")}
     app_name = application_name(project, roots)
     application_directory = report_application_directory(app_name)
     dockerfile = select_dockerfile(files, project)
-    image_requested = bool(options.image or (options.build_image and dockerfile))
+    if options.build_image and not dockerfile:
+        raise ValueError("--build-image requires a root Dockerfile or exactly one discovered Dockerfile. "
+                         "Select the application directory or pass --image IMAGE.")
+    image_requested = bool(options.image or options.build_image)
     java_app = bool(files["java"] or files["jars"] or files["maven"] or files["gradle"])
     java_needed = bool(files["jars"] or files["maven"] or files["gradle"])
     applicability = {
@@ -254,6 +289,18 @@ def execute(options, system, arch):
             "OpenTofu files found, but native .tofu/.tofu.json coverage is unavailable"
             if files["opentofu"] else "No supported infrastructure candidates"),
     }
+    home = Path(os.environ.get("ACCIDION_HOME", Path.home() / ".accidion")).resolve()
+    report_parent = (options.report_dir or home / "reports").resolve()
+    application_reports = (report_parent / application_directory).resolve()
+    cache = (home / "tools").resolve()
+    if report_parent.is_relative_to(project):
+        raise ValueError(f"Private report directory must be outside the application: {report_parent}")
+    if application_reports.is_relative_to(project) or application_reports.parent != report_parent:
+        raise ValueError(f"Application report directory must stay under the private report parent: {application_reports}")
+    if cache.is_relative_to(project):
+        raise ValueError(f"Tool cache must be outside the application: {cache}")
+    validate_report_directory(application_reports, "Private report path")
+
     discovery = {key: len(items) for key, items in files.items()}
     if options.dry_run:
         print(json.dumps({"platform": system, "architecture": arch, "project": str(project),
@@ -264,13 +311,6 @@ def execute(options, system, arch):
                           "scanContainer": image_requested, "scanners": applicability}, indent=2))
         return 0
 
-    home = Path(os.environ.get("ACCIDION_HOME", Path.home() / ".accidion")).resolve()
-    report_parent = (options.report_dir or home / "reports").resolve()
-    application_reports = (report_parent / application_directory).resolve()
-    cache = (home / "tools").resolve()
-    if (report_parent.is_relative_to(project) or cache.is_relative_to(project)
-            or application_reports.is_relative_to(project) or application_reports.parent != report_parent):
-        raise ValueError("Report and tool directories must be outside the project being scanned")
     report_dir = private_run_path(application_reports)
     started = datetime.now(timezone.utc)
     redactor = Redactor()
@@ -488,8 +528,6 @@ def execute(options, system, arch):
                 run_grype(cmd, f"sbom:{work / REPORTS['syft']}", out)
 
             def grype_image(cmd, out):
-                if options.build_image and not dockerfile:
-                    raise RuntimeError("Select a project with one Dockerfile or a root Dockerfile, or supply --image")
                 if not docker:
                     raise RuntimeError("Docker CLI is unavailable")
                 invoke(docker, "info", "--format", "{{.ServerVersion}}")
