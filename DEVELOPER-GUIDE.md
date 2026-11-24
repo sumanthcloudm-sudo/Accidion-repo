@@ -8,25 +8,13 @@ Run the kit from your application directory. It installs missing tools where per
 
 ### Quick Start
 
-1. Obtain the approved Accidion Starter Kit from your team. Follow the [download instructions](#get-the-reviewed-kit) and keep the complete kit together.
-2. Open **Git Bash** on Windows or **Bash** on Ubuntu, other Linux distributions, or macOS. On macOS, open Terminal and enter `bash`. Change to your Java application directory. Replace the example path with your own.
+1. Open **Git Bash** on Windows or **Bash** on Ubuntu, standalone Linux, or macOS. On macOS, open Terminal and enter `bash`.
+2. Follow [Get the reviewed kit](#get-the-reviewed-kit) to clone Accidion into `$HOME/devsecops/Accidion-repo` and check out the full reviewed commit SHA supplied by your release owner or team handover. Keeping the kit separate from your application is the recommended workflow.
+3. Replace the example path with your existing Java Maven application directory, then run the launcher from that directory.
 
    ~~~bash
-   cd ~/projects/orders-service
-   ~~~
-
-3. From your application directory, run the command that matches where you saved the kit.
-
-   **Kit inside your application directory**
-
-   ~~~bash
-   bash security-scan.sh
-   ~~~
-
-   **Kit stored separately** — Use the full path to the launcher. Adjust this example if you saved the kit elsewhere.
-
-   ~~~bash
-   bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
+   cd "$HOME/projects/orders-service" &&
+     bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
    ~~~
 
 4. The kit installs missing supported tools automatically where permissions allow. When the scan finishes, open `reports/security-summary.json` in your application directory to see which scans ran and what they found.
@@ -54,6 +42,18 @@ Use the release approved by your team. The public source is available in the [Ac
 
 Cloning the public repository over HTTPS requires Git. GitHub sign-in is optional for public cloning. The authentication steps below apply when you choose the authenticated release launcher or need access to a private repository.
 
+**Recommended local workflow.** Ask the release owner for the full, 40-character reviewed commit SHA, or get it from your team’s approved release handover. Have it ready before running the commands below. When prompted, paste that full SHA. If you haven’t received it, ask the release owner before running the kit.
+
+~~~bash
+mkdir -p "$HOME/devsecops"
+git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo" &&
+  read -r -p 'Reviewed full commit SHA: ' reviewed_commit &&
+  [[ "$reviewed_commit" =~ ^[0-9a-f]{40}$ ]] &&
+  git -C "$HOME/devsecops/Accidion-repo" checkout --detach "$reviewed_commit"
+~~~
+
+If your team supplies a complete approved ZIP instead, extract it into `$HOME/devsecops/Accidion-repo` with `security-scan.sh` directly inside that folder. For a private checkout, use the repository and access instructions in your team’s handover.
+
 For an **authenticated release**, open Bash in your Java application directory. The release launcher requires Bash 3.2+, curl 7.83.1+, tar with gzip, `sha256sum` or `shasum`, HTTPS access to GitHub, and a writable temporary directory outside the application. If your release uses GitHub CLI, sign in and complete any required organization SSO.
 
 ~~~bash
@@ -64,16 +64,6 @@ gh auth status --hostname github.com
 Run the matching [public release command](README.md#run-from-the-public-github-repository), [private release-asset command](README.md#one-command-from-your-java-project-private-distribution), or [private archive command without GitHub CLI](README.md#alternate-pinned-archive-download-without-github-cli). The public launcher also accepts an approved token supplied through your credential store or a cached Git credential-manager login.
 
 Use the full commit SHA and both SHA-256 digests from the release handover. The launcher verifies its own download and the kit archive before running the scan. If a value is missing or verification fails, ask the release owner for the matching handover. Keep tokens out of command history, scripts, and reports.
-
-For a **local copy**, extract the complete approved ZIP supplied by your team. If your team uses a checkout of the public repository instead, run the following and enter the full commit SHA from the reviewed handover when prompted. Private users should clone their team’s approved repository using the access instructions in the handover.
-
-~~~bash
-mkdir -p "$HOME/devsecops"
-git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo" &&
-  read -r -p 'Reviewed full commit SHA: ' reviewed_commit &&
-  [[ "$reviewed_commit" =~ ^[0-9a-f]{40}$ ]] &&
-  git -C "$HOME/devsecops/Accidion-repo" checkout --detach "$reviewed_commit"
-~~~
 
 ### How to Execute security-scan.sh
 
@@ -114,19 +104,19 @@ orders-service/
 
 Choose the command that matches where you saved the kit. By default, the scan targets your **current working directory**, so stay in the application directory for either method.
 
-**Kit inside the application directory.** If `security-scan.sh` and the other kit files are present in your application directory, run:
-
-~~~bash
-bash security-scan.sh
-~~~
-
-**Kit in a separate directory.** If you saved the complete kit under `$HOME/devsecops/Accidion-repo`, run the launcher by its path:
+**Recommended — Keep the kit separate.** From your Java Maven application directory, run the launcher from the checkout created above:
 
 ~~~bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
 ~~~
 
 If you saved the kit elsewhere, adjust the launcher path in the command.
+
+**Alternative — Keep the complete kit inside the application.** This method requires the launcher and all companion files, including the Python modules and scanner configurations, together in the application directory.
+
+~~~bash
+bash security-scan.sh
+~~~
 
 #### Step 5 — Let the kit install tools and scan
 
