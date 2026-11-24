@@ -283,7 +283,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --setup-only
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --no-install
 ```
 
-Dry run previews discovery without installing, scanning or writing reports (if Python is missing it cannot discover files). Setup-only prepares tools without scanning. No-install disables kit-managed installation; builds and vulnerability databases may still require network access. These modes are mutually exclusive.
+Dry run previews discovery without installing, scanning or writing reports (if Python is missing it cannot discover files). Setup-only prepares tools without scanning. No-install disables kit-managed installation; builds and vulnerability databases may still require network access. The --dry-run and --setup-only modes are mutually exclusive. The --no-install option can be combined with either mode.
 
 ## 13. Java dependency resolution
 
@@ -585,3 +585,47 @@ Exit code 0 alone is not release approval. The designated release authority make
 - [ ] Latest reports reviewed and retained through approved channels.
 
 For implementation details see the [README](README.md). This guide describes the public checkout workflow and its current configurations. It does not claim validation of every OS, architecture, rule, or live scan.
+
+
+## 29. Enhanced security reporting (pending implementation publication)
+
+The following enhancements have been developed locally for the next toolkit update. Use an approved revision containing the corresponding Python changes before relying on these features. External application and fresh Ubuntu end-to-end testing remain pending.
+
+### Individual findings
+
+The enhanced terminal output presents findings one by one: issue number, meaningful issue name, scanner, severity, affected file, available line range, rule and vulnerability identifiers, dependency versions, description, root cause, security impact and recommended remediation. Review the native scanner evidence and advisory before applying fixes. Missing information must not be interpreted as absence of risk.
+
+### Maven dependency relationships
+
+Dependency resolution attempts to collect Maven JSON dependency trees automatically. Developers continue to run the same single security-scan.sh command; no separate dependency-tree command is required for this feature.
+
+When matching evidence is available, dependency findings can include:
+
+- Maven coordinate and installed version.
+- Direct or transitive dependency classification.
+- Dependency chains and, for a unique transitive chain, parent and direct dependency details.
+- Matching direct dependency declaration file and line range.
+- Dependency-specific remediation.
+
+Illustrative chain: application -> jackson-databind:2.9.8 -> jackson-core:2.9.8.
+
+For a confirmed vulnerability in jackson-core, investigate a compatible supported update to jackson-databind or an approved dependency management constraint. Verify the resolved version, rebuild, test and rescan.
+
+Declaration lines identify build manifest declarations, not vulnerable library source code. Exact declaration matching can be unavailable for inherited properties, profiles, BOMs or ambiguous declarations. A project dependency graph match does not establish container package provenance or runtime exploitability. Equivalent Gradle dependency-chain enrichment is not implemented. Multiple scanners can report overlapping findings.
+
+### Additional JSON evidence
+
+The private scan report directory may contain maven-dependency-tree-*.json files when collection succeeds. Enhanced normalized findings may contain dependency_type, dependency_chains, maven_coordinate, parent_dependency, parent_version, direct_dependency, direct_dependency_version, direct_dependency_source_file, direct_dependency_start_line, direct_dependency_end_line and dependency_remediation. These fields are conditional on evidence. Original scanner reports remain available when generated.
+
+### SBOM component output
+
+The enhanced terminal inventory displays individual component numbers, names, groups, types, versions, package URLs, locations and licenses where available. Syft components are inventory, not vulnerability findings.
+
+### Execution timing
+
+Enhanced reporting records available installation and scanner start and completion timestamps and durations, together with total scan duration. First-run downloads, dependency resolution, database updates and application size can affect runtime. No fixed runtime is guaranteed.
+
+### Ubuntu and external application validation
+
+The documented single-command workflow is intended for supported Java applications, including e-commerce and enterprise projects. Fresh Ubuntu installation and separate application testing are outstanding. The launcher does not invoke sudo; obtain approved Python 3.10+, matching virtual environment support, Git and a compatible JDK from IT where system package installation requires privileges. Run normal scans without elevation. A scan does not certify banking, payment or other regulatory compliance.
+
