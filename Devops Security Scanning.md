@@ -192,7 +192,7 @@ Your application can use Maven or Gradle. Finish its normal build and tests befo
 - **Linux:** open **Bash**.
 - **macOS:** open **Bash**.
 - **All platforms:** Git, a writable home directory, and approved network access are needed for cloning and first-run downloads.
-- **Python:** 3.10 or newer and compatible environment support are required by the runner.
+- **Automatic tool setup:** Accidion automatically detects and attempts to install missing Python and security scanning tools on supported operating systems.
 - **Java builds/dependency checks:** use an appropriate JDK (Java 11 or newer for Dependency-Check), Maven/Gradle as applicable, and reachable approved dependency repositories.
 - **Docker:** optional, only for image scanning.
 
