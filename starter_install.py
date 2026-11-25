@@ -245,10 +245,16 @@ class Installer:
                 self.records[name]["completedAt"] = datetime.now(timezone.utc).isoformat()
                 self.records[name]["durationSeconds"] = round(time.perf_counter() - ensure_started, 2)
 
+    def pypi_version(self, name):
+        # 1.182 is the final upstream native Intel macOS release.
+        if name == "semgrep" and self.system == "macos" and self.arch == "amd64":
+            return "1.182.0"
+        return PYPI[name]
+
     def managed(self, name):
         suffix = ".exe" if self.system == "windows" else ""
         if name in PYPI:
-            base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
+            base = self.cache / f"{name}-{self.pypi_version(name)}-{sys.version_info.major}.{sys.version_info.minor}"
             path = base / ("Scripts" if suffix else "bin") / (name + suffix)
             if name == "checkov" and suffix and not path.is_file():
                 interpreter = base / "Scripts/python.exe"
@@ -294,7 +300,7 @@ class Installer:
         return cmd
 
     def install_pypi(self, name):
-        base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
+        base = self.cache / f"{name}-{self.pypi_version(name)}-{sys.version_info.major}.{sys.version_info.minor}"
         created = not base.exists()
         if base.is_symlink():
             raise RuntimeError("Refusing to modify a symlinked scanner cache")
@@ -310,9 +316,9 @@ class Installer:
         self.records[f"pip:{name}"] = {"status": "installed" if created else "reused", "version": pip.split()[1]}
         try:
             run([python, "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
-                 "--retries", "2", f"{name}=={PYPI[name]}"], log=self.log)
+                 "--retries", "2", f"{name}=={self.pypi_version(name)}"], log=self.log)
         except RuntimeError as error:
-            raise RuntimeError(f"Could not install {name} {PYPI[name]} wheels for {self.system}/{self.arch} "
+            raise RuntimeError(f"Could not install {name} {self.pypi_version(name)} wheels for {self.system}/{self.arch} "
                                f"with Python {sys.version_info.major}.{sys.version_info.minor}. "
                                "Check wheel availability and the approved package index in run.log.") from error
 
