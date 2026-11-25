@@ -791,8 +791,28 @@ def execute(options, system, arch):
                 if resolution_error:
                     raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
                 database = vulnerability_cache("dependency-check", home / "dependency-check-data")
+                # A cold NVD REST API sync without a dedicated API key is frequently
+                # rate-limited (HTTP 429). Use OWASP's documented JSON 2.0 mirror.
+                # Organizations can supply an approved, centrally managed feed.
+                feed = os.environ.get(
+                    "ACCIDION_NVD_DATAFEED_URL",
+                    "https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/nvdcve-{0}.json.gz",
+                )
+                from urllib.parse import urlsplit
+                parsed_feed = urlsplit(feed)
+                if (parsed_feed.scheme != "https" or not parsed_feed.hostname
+                        or parsed_feed.username or parsed_feed.password
+                        or feed.count("{0}") != 1):
+                    raise ValueError(
+                        "ACCIDION_NVD_DATAFEED_URL must be an HTTPS NVD JSON 2.0 "
+                        "feed template containing exactly one {0} placeholder"
+                    )
+                diagnostics.append(
+                    "OWASP Dependency-Check uses a configured NVD JSON 2.0 "
+                    "feed; ensure its freshness and availability meet organizational policy"
+                )
                 args = ["--project", project.name, "--format", "JSON", "--out", out.parent,
-                        "--data", database, "--scan", deps]
+                        "--data", database, "--nvdDatafeed", feed, "--scan", deps]
                 for artifact in files["jars"]:
                     args.extend(("--scan", artifact))
                 invoke(cmd, *args)
