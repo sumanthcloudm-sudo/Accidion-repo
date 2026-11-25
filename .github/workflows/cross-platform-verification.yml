@@ -56,7 +56,19 @@ jobs:
           PY
       - name: Execute all applicable scanners
         shell: bash
-        run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --report-dir "$RUNNER_TEMP/accidion-results"
+        run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --report-dir "$RUNNER_TEMP/accidion-results" --verbose
+      - name: Show scanner failure reasons
+        if: failure()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          for report in (Path(os.environ["RUNNER_TEMP"]) / "accidion-results").rglob("security-summary.json"):
+              for name, record in json.loads(report.read_text(encoding="utf-8")).get("scanners", {}).items():
+                  if record.get("status") == "failed":
+                      print(name, record.get("reason"))
+          PY
       - name: Preserve scanner diagnostics
         if: always()
         uses: actions/upload-artifact@v4
