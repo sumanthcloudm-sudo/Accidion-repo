@@ -339,6 +339,11 @@ class Installer:
             extracted.mkdir()
             unpack(archive, extracted)
             (extracted / ".complete").touch()
+            # Recover interrupted archive installations only after verification.
+            if destination.is_symlink():
+                raise RuntimeError("Refusing to modify a symlinked scanner cache")
+            if destination.is_dir() and not (destination / ".complete").is_file():
+                shutil.rmtree(destination)
             try:
                 extracted.rename(destination)
             except OSError:
