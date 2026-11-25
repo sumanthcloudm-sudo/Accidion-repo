@@ -250,6 +250,10 @@ class Installer:
         if name in PYPI:
             base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
             path = base / ("Scripts" if suffix else "bin") / (name + suffix)
+            if name == "checkov" and suffix and not path.is_file():
+                interpreter = base / "Scripts/python.exe"
+                if interpreter.is_file():
+                    return [str(interpreter), "-c", "from checkov.main import run; raise SystemExit(run())"]
         elif name in RELEASES or name in {"mvn", "gradle"}:
             base = self.cache / f"{name}-{self.release_version(name)}-{self.system}-{self.arch}"
             if not (base / ".complete").exists():
