@@ -37,7 +37,21 @@ jobs:
           printf '%s\n' 'FROM alpine:3.22' > "$RUNNER_TEMP/accidion-fixture/Dockerfile"
       - name: Install and verify scanners
         shell: bash
-        run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --setup-only
+        run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --setup-only --verbose --report-dir "$RUNNER_TEMP/accidion-setup-results"
+      - name: Show installation failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "accidion-setup-results"
+          for report in root.rglob("security-summary.json"):
+              data = json.loads(report.read_text(encoding="utf-8"))
+              for name, record in data.get("installations", {}).items():
+                  if record.get("status") in ("unavailable", "installation_failed"):
+                      print(name, record.get("status"), record.get("reason"))
+          PY
       - name: Execute all applicable scanners
         shell: bash
         run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --report-dir "$RUNNER_TEMP/accidion-results"
