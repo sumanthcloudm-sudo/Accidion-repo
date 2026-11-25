@@ -193,38 +193,46 @@ def select_dockerfile(files, project):
 
 
 def resolve_dependencies(project, builds, out, log, diagnostic):
+    failures = []
     for index, (family, root, tool) in enumerate(builds):
-        if not tool:
-            raise RuntimeError(f"No usable {family} build tool for {root.relative_to(project)}")
-        target = out / str(index)
-        target.mkdir()
-        if family == "maven":
-            args = [*tool, "-B", "-f", root / "pom.xml",
-                    "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies",
-                    "-Dmdep.useRepositoryLayout=true",
-                    f"-DoutputDirectory={target}"]
-        else:
-            args = [*tool, "--no-daemon", "--no-configuration-cache", "--console=plain", "--init-script",
-                    KIT / "accidion-dependencies.gradle", f"-PaccidionDependencyDirectory={target}",
-                    "accidionCollectDependencies"]
-        run(args, cwd=root, log=log)
-        if family == "maven":
-            tree_file = target / "maven-dependency-tree.json"
-
-            tree_args = [
-                *tool, "-B", "-f", root / "pom.xml",
-                "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree",
-                "-DoutputType=json", "-DappendOutput=true",
-                f"-DoutputFile={tree_file.resolve()}"
-            ]
-
-        else:
-            tree_args = [*args[:-1], "accidionDependencyPaths"]
-
         try:
-            run(tree_args, cwd=root, log=log)
-        except Exception as error:
-            diagnostic(f"{family} dependency paths unavailable ({type(error).__name__})")
+            if not tool:
+                raise RuntimeError(f"No usable {family} build tool for {root.relative_to(project)}")
+            target = out / str(index)
+            target.mkdir()
+            if family == "maven":
+                args = [*tool, "-B", "-f", root / "pom.xml",
+                        "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies",
+                        "-Dmdep.useRepositoryLayout=true",
+                        f"-DoutputDirectory={target}"]
+            else:
+                args = [*tool, "--no-daemon", "--no-configuration-cache", "--console=plain", "--init-script",
+                        KIT / "accidion-dependencies.gradle", f"-PaccidionDependencyDirectory={target}",
+                        "accidionCollectDependencies"]
+            run(args, cwd=root, log=log)
+            if family == "maven":
+                tree_file = target / "maven-dependency-tree.json"
+
+                tree_args = [
+                    *tool, "-B", "-f", root / "pom.xml",
+                    "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree",
+                    "-DoutputType=json", "-DappendOutput=true",
+                    f"-DoutputFile={tree_file.resolve()}"
+                ]
+
+            else:
+                tree_args = [*args[:-1], "accidionDependencyPaths"]
+
+            try:
+                run(tree_args, cwd=root, log=log)
+            except Exception as error:
+                diagnostic(f"{family} dependency paths unavailable ({type(error).__name__})")
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            failure = f"{family} dependency resolution failed for {root.relative_to(project)}: {error}"
+            diagnostic(failure)
+            failures.append(failure)
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
 
 def maven_trees(path):
