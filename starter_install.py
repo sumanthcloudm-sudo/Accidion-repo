@@ -67,6 +67,9 @@ def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,),
         timeout=timeout, encoding="utf-8", errors="replace",
     )
     if result.returncode not in accepted:
+        if capture and log is not None and result.stdout:
+            log.write(result.stdout + "\n")
+            log.flush()
         raise RuntimeError(f"Command exited with status {result.returncode}")
     return result.stdout or ""
 
@@ -195,7 +198,7 @@ class Installer:
             if not javac.exists():
                 raise RuntimeError("A JDK with javac is required")
             run([javac, "-version"], capture=True, timeout=30)
-        output = run([*cmd, flag], cwd=cwd, capture=True, timeout=180)
+        output = run([*cmd, flag], cwd=cwd, capture=True, log=self.log, timeout=180)
         match = re.search(r"\b(\d+\.\d+(?:\.\d+)?)\b", output)
         if not match or tuple(map(int, match[1].split("."))) < MINIMUM[name]:
             raise RuntimeError("Version is missing or below the supported minimum")
