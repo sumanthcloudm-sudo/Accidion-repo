@@ -222,14 +222,14 @@ class Installer:
             existing = shutil.which(name)
             java_home = os.environ.get("JAVA_HOME") if name == "java" else None
             java = Path(java_home) / ("bin/java.exe" if os.name == "nt" else "bin/java") if java_home else None
-            candidates = ([wrapper] if wrapper else
-                          [[java] if java and java.is_file() else None, [existing] if existing else None, self.managed(name)])
+            candidates = [wrapper, [java] if java and java.is_file() else None,
+                          [existing] if existing else None, self.managed(name)]
             for cmd in filter(None, candidates):
                 try:
                     version = self.version(name, cmd, cwd)
-                except (OSError, RuntimeError, subprocess.SubprocessError):
-                    if wrapper:
-                        raise
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    print(f"{name} candidate validation failed ({type(error).__name__}): {error}",
+                          file=self.log, flush=True)
                     continue
                 self.records[name] = {"status": "reused", "version": version}
                 return cmd
