@@ -57,6 +57,18 @@ jobs:
       - name: Execute all applicable scanners
         shell: bash
         run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --report-dir "$RUNNER_TEMP/accidion-results"
+      - name: Preserve scanner diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-diagnostics-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/accidion-results/**/run.log
+            ${{ runner.temp }}/accidion-results/**/security-summary.json
+            ${{ runner.temp }}/accidion-setup-results/**/run.log
+            ${{ runner.temp }}/accidion-setup-results/**/security-summary.json
+          if-no-files-found: warn
+          retention-days: 3
       - name: Verify JSON output
         shell: bash
         run: |
