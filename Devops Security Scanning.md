@@ -363,39 +363,7 @@ Every completed scan normally generates `security-summary.json` and `run.log`. N
 | `--scanner gitleaks,semgrep` | Gitleaks and Semgrep reports |
 | `--scanner all --image my-app:latest` | Applicable scanner outputs plus image findings and possible `grype-sbom-report.json` |
 
-Example complete run (all six applicable stages produce reports):
-
-```text
-scan-<timestamp>-<id>/
-  security-summary.json
-  gitleaks-report.json
-  semgrep-report.json
-  dependency-check-report.json
-  syft-sbom.json
-  grype-report.json
-  checkov-report.json
-  run.log
-```
-
-Example Docker-only run:
-
-```text
-scan-<timestamp>-<id>/
-  security-summary.json
-  grype-report.json
-  run.log
-```
-
-Example Maven-only run:
-
-```text
-scan-<timestamp>-<id>/
-  security-summary.json
-  dependency-check-report.json
-  run.log
-```
-
-Maven dependency metadata may also be generated. Grype package scanning has a Syft prerequisite; therefore an individual selection is not always strictly one native report. A full scan does not guarantee six outputs if a scanner is inapplicable or fails. Check status and reason in the summary.
+Reports are generated based on the selected and applicable scanners. Some scanners may require additional prerequisite reports. Review `security-summary.json` to identify completed, skipped or failed scans.
 
 ### How a developer uses the findings
 
