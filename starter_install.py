@@ -262,7 +262,7 @@ class Installer:
             if name == "checkov" and suffix and not path.is_file():
                 interpreter = base / "Scripts/python.exe"
                 if interpreter.is_file():
-                    return [str(interpreter), "-c", "from checkov.main import run; raise SystemExit(run())"]
+                    return [str(interpreter), "-c", "from importlib.metadata import distribution; raise SystemExit(next(ep for ep in distribution('checkov').entry_points if ep.group == 'console_scripts' and ep.name == 'checkov').load()())"]
         elif name in RELEASES or name in {"mvn", "gradle"}:
             base = self.cache / f"{name}-{self.release_version(name)}-{self.system}-{self.arch}"
             if not (base / ".complete").exists():
