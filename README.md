@@ -8,12 +8,14 @@ identification, and JSON report generation.
 
 ## Supported Platforms
 
-- Ubuntu Linux (Bash)
+- Windows (Git Bash)
+- Linux (Bash)
+- macOS (Bash)
 
-Other platforms require separate validation.
-
-Automatic installation depends on platform compatibility,
-network access, and installation permissions.
+The starter kit is designed for cross-platform security scanning.
+Automatic tool installation depends on operating system compatibility,
+system architecture, network access, and installation permissions.
+Complete native Linux and macOS end-to-end validation remains pending.
 
 ## Security Tools
 
