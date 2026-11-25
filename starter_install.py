@@ -224,6 +224,8 @@ class Installer:
             java = Path(java_home) / ("bin/java.exe" if os.name == "nt" else "bin/java") if java_home else None
             candidates = [wrapper, [java] if java and java.is_file() else None,
                           [existing] if existing else None, self.managed(name)]
+            if name == "java" and self.system == "linux":
+                candidates.extend([str(p)] for p in sorted(Path("/usr/lib/jvm").glob("*/bin/java")) if p.is_file())
             for cmd in filter(None, candidates):
                 try:
                     version = self.version(name, cmd, cwd)
@@ -263,6 +265,11 @@ class Installer:
                 interpreter = base / "Scripts/python.exe"
                 if interpreter.is_file():
                     return [str(interpreter), "-c", "from checkov.main import Checkov; raise SystemExit(Checkov().run())"]
+        elif name == "java" and self.system == "linux":
+            base = self.cache / f"java-21.0.11+10-{self.system}-{self.arch}"
+            if not (base / ".complete").is_file():
+                return None
+            path = next(base.glob("*/bin/java"), base / "missing")
         elif name in RELEASES or name in {"mvn", "gradle"}:
             base = self.cache / f"{name}-{self.release_version(name)}-{self.system}-{self.arch}"
             if not (base / ".complete").exists():
@@ -284,6 +291,9 @@ class Installer:
         if name in PYPI:
             self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.install_pypi(name)
+        elif name == "java" and self.system == "linux":
+            self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.install_archive(name)
         elif name in RELEASES or name in {"mvn", "gradle"}:
             self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.install_archive(name)
@@ -326,8 +336,16 @@ class Installer:
                                "Check wheel availability and the approved package index in run.log.") from error
 
     def install_archive(self, name):
-        version = self.release_version(name)
-        if name in RELEASES:
+        version = "21.0.11+10" if name == "java" else self.release_version(name)
+        if name == "java":
+            arch = {"amd64": "x64", "arm64": "aarch64"}[self.arch]
+            asset_name = f"OpenJDK21U-jdk_{arch}_linux_hotspot_21.0.11_10.tar.gz"
+            url = f"https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/{asset_name}"
+            algorithm = "sha256"
+            expected = fetch(url + ".sha256.txt").decode("ascii").split()[0]
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+                raise RuntimeError("Invalid JDK checksum")
+        elif name in RELEASES:
             repo, _ = RELEASES[name]
             asset_name = release_asset(name, version, self.system, self.arch)
             release = json.loads(fetch(f"https://api.github.com/repos/{repo}/releases/tags/v{version}"))
