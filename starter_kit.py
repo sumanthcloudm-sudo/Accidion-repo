@@ -565,6 +565,8 @@ def execute(options, system, arch):
     started = datetime.now(timezone.utc)
     scan_clock = time.monotonic()
     redactor = Redactor()
+    live_log = report_dir / "run.log"
+    live_log.touch()
     statuses = {}
     issues = []
     terminal_metadata = []
@@ -576,6 +578,8 @@ def execute(options, system, arch):
         prefix = "\n" if message.startswith("\n") else ""
         safe = "".join(char if char.isprintable() else " " for char in redactor.text(message.lstrip("\n")))
         print(prefix + safe, flush=True)
+        with live_log.open("a", encoding="utf-8") as output:
+            output.write(prefix + safe + "\n")
 
     emit("=== Accidion Security Scan ===" if not options.setup_only else "=== Accidion Setup ===")
     terminal_field(emit, "Application", app_name)
@@ -768,7 +772,9 @@ def execute(options, system, arch):
                     return
                 resolved_dependencies = True
                 try:
+                    emit("Preparing Maven/Gradle dependencies...")
                     resolve_dependencies(project, builds, deps, log, diagnostics.append)
+                    emit("Dependency resolution completed.")
 
                     for tree in sorted(deps.rglob("maven-dependency-tree.json")):
                         try:
@@ -790,6 +796,7 @@ def execute(options, system, arch):
                 prepare_dependencies()
                 if resolution_error:
                     raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
+                emit("OWASP Dependency-Check: preparing vulnerability database...")
                 database = vulnerability_cache("dependency-check", home / "dependency-check-data")
                 # A cold NVD REST API sync without a dedicated API key is frequently
                 # rate-limited (HTTP 429). Use OWASP's documented JSON 2.0 mirror.
@@ -815,7 +822,9 @@ def execute(options, system, arch):
                         "--data", database, "--nvdDatafeed", feed, "--scan", deps]
                 for artifact in files["jars"]:
                     args.extend(("--scan", artifact))
+                emit("OWASP Dependency-Check: starting database update and dependency analysis...")
                 invoke(cmd, *args)
+                emit("OWASP Dependency-Check: execution completed.")
 
             def syft(cmd, out):
                 # Inventory the resolved dependencies independently of the original project
@@ -924,7 +933,9 @@ def execute(options, system, arch):
                 contexts = dependency_contexts(project, builds, deps, diagnostics.append, files["maven"])
 
         log.seek(0)
-        (report_dir / "run.log").write_text(redactor.text(log.read()), encoding="utf-8")
+        with live_log.open("a", encoding="utf-8") as output:
+            output.write("\n=== Scanner diagnostics ===\n")
+            output.write(redactor.text(log.read()))
 
     summary = {"schemaVersion": 2, "applicationName": app_name, "scanStartedAt": started.isoformat(),
                "generatedAt": datetime.now(timezone.utc).isoformat(),
