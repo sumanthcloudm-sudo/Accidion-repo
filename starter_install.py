@@ -288,13 +288,15 @@ class Installer:
     def install_pypi(self, name):
         base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
         created = not base.exists()
+        if base.is_symlink():
+            raise RuntimeError("Refusing to modify a symlinked scanner cache")
         try:
-            run([sys.executable, "-m", "venv", base], log=self.log)
+            run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
         except RuntimeError:
             if self.system != "linux":
                 raise
             run(package_command(self.system, "pip"), log=self.log)
-            run([sys.executable, "-m", "venv", base], log=self.log)
+            run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
         python = base / ("Scripts/python.exe" if self.system == "windows" else "bin/python")
         pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
         self.records[f"pip:{name}"] = {"status": "installed" if created else "reused", "version": pip.split()[1]}
