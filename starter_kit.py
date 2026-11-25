@@ -208,7 +208,6 @@ def resolve_dependencies(project, builds, out, log, diagnostic):
                     KIT / "accidion-dependencies.gradle", f"-PaccidionDependencyDirectory={target}",
                     "accidionCollectDependencies"]
         run(args, cwd=root, log=log)
-
         if family == "maven":
             tree_file = target / "maven-dependency-tree.json"
 
@@ -309,6 +308,9 @@ def enrich_maven_finding(issue, project, report_dir):
 
     if not coordinate or not version:
         return
+
+    if coordinate.count(":") == 2:
+        coordinate = coordinate.rsplit(":", 1)[0]
 
     paths = []
 
@@ -553,6 +555,7 @@ def execute(options, system, arch):
     report_dir = private_run_path(application_reports)
     total_started = time.perf_counter()
     started = datetime.now(timezone.utc)
+    scan_clock = time.monotonic()
     redactor = Redactor()
     statuses = {}
     issues = []
@@ -639,6 +642,7 @@ def execute(options, system, arch):
         log.flush()
 
         def execute_scan(name, action, skip=None):
+            scan_started = time.monotonic()
             label = NAMES.get(name, "Syft")
             installation = installer.records[name]
             entry = {"status": "skipped", "reason": skip, "report": None,
@@ -895,7 +899,9 @@ def execute(options, system, arch):
         (report_dir / "run.log").write_text(redactor.text(log.read()), encoding="utf-8")
 
     summary = {"schemaVersion": 2, "applicationName": app_name, "scanStartedAt": started.isoformat(),
-               "generatedAt": datetime.now(timezone.utc).isoformat(), "platform": system, "architecture": arch,
+               "generatedAt": datetime.now(timezone.utc).isoformat(),
+               "durationSeconds": round(time.monotonic() - scan_clock, 2),
+               "platform": system, "architecture": arch,
                "kitCommit": os.environ.get("ACCIDION_KIT_COMMIT"),
                "kitArchiveSha256": os.environ.get("ACCIDION_KIT_ARCHIVE_SHA256"),
                "project": str(project), "mode": "setup-only" if options.setup_only else "scan",

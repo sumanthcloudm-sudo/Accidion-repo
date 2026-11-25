@@ -8,9 +8,9 @@ identification, and JSON report generation.
 
 ## Supported Platforms
 
-- Windows (Git Bash)
-- Linux (Bash)
-- macOS (Bash)
+- Ubuntu Linux (Bash)
+
+Other platforms require separate validation.
 
 Automatic installation depends on platform compatibility,
 network access, and installation permissions.

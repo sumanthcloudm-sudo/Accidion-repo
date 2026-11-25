@@ -153,7 +153,8 @@ def new_issue(scanner, **evidence):
         "source_file", "affected_filename", "relative_file_path",
         "start_line", "end_line", "issue_description", "root_cause", "security_impact",
         "recommended_remediation", "rule_id", "cwe_id", "cve_id", "affected_dependency",
-        "installed_version", "fixed_version", "reference_links",
+        "installed_version", "fixed_version", "maven_coordinate", "dependency_type",
+        "parent_dependency", "parent_version", "dependency_chains", "reference_links",
     ))
     issue.update(scanner_name=NAMES[scanner], **evidence)
     if source := issue["source_file"]:
@@ -571,9 +572,9 @@ def grype_issues(report, _project, *, terminal=False):
                         cve_id=identifiers(CVE, [identifier, *(entry.get("id") for entry in row.get("relatedVulnerabilities") or [])]) or None,
                         affected_dependency=component, installed_version=first_text(artifact.get("version")),
                         maven_coordinate=(
-                            f"{group}:{artifact_id}"
+                            f"{group}:{artifact_id}:{installed}"
                             if artifact.get("type") == "java-archive"
-                            and group and artifact_id else None
+                            and group and artifact_id and installed else None
                         ),
                         fixed_version=versions or None, reference_links=references(vuln.get("urls"), vuln.get("dataSource")))
 
