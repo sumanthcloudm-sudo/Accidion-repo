@@ -130,43 +130,45 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks,semgrep
 
 #### Docker image only
 
-When: you already built or pulled an image and want image vulnerabilities only. Where: developer terminal with the application root selected and Docker running. No full Java/Maven scan is needed. Report: `grype-report.json`.
+Run from the application root with Docker installed, running and accessible. Only Grype scans the image. Report: `grype-report.json`.
 
-List locally available images:
+List local images:
 
 ```bash
 docker images
 ```
 
-Scan the selected image (replace the example name and tag with your own):
+Scan an existing image (replace the name and tag):
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --image my-app:latest
 ```
 
-Alternatively, build and scan the application image using its Dockerfile:
+Build and scan using the application Dockerfile:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --build-image
 ```
 
-Only Grype runs for these Docker-only commands. Docker must be installed, running and accessible.
-
 #### Complete scan including Docker
 
-When: before releasing both the application and its image. Where: application root. Reports: applicable application reports plus image findings; `grype-sbom-report.json` may additionally contain package findings.
+Run from the application root to scan both the application and its image.
+
+Scan all applicable targets including an existing image:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all --image my-app:latest
 ```
 
-Or build the application image as part of the complete scan:
+Build the image and run the complete scan:
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all --build-image
 ```
 
-For all available optional arguments, use `bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --help`.
+Reports: applicable application reports and image findings, with `grype-sbom-report.json` when package findings are produced. Docker is optional for normal Java scans.
+
+For additional options, use `bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --help`.
 
 ## 3. Steps to run Accidion on your own Java application
 
