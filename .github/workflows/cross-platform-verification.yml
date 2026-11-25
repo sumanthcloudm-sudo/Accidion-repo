@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -25,14 +25,15 @@ jobs:
       - name: Validate launcher and Python syntax
         shell: bash
         run: |
-          bash -n security-scan.sh python-bootstrap.sh
+          bash -n security-scan.sh
+          bash -n python-bootstrap.sh
           python -m compileall -q starter_install.py starter_kit.py
       - name: Create isolated Java and IaC test project
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/accidion-fixture/src/main/java"
           printf '%s\n' 'class Example { public static void main(String[] args) {} }' > "$RUNNER_TEMP/accidion-fixture/src/main/java/Example.java"
-          printf '%s\n' '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>example</groupId><artifactId>fixture</artifactId><version>1.0</version></project>' > "$RUNNER_TEMP/accidion-fixture/pom.xml"
+          printf '%s\n' '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>example</groupId><artifactId>fixture</artifactId><version>1.0</version><properties><maven.compiler.source>17</maven.compiler.source><maven.compiler.target>17</maven.compiler.target></properties></project>' > "$RUNNER_TEMP/accidion-fixture/pom.xml"
           printf '%s\n' 'FROM alpine:3.22' > "$RUNNER_TEMP/accidion-fixture/Dockerfile"
       - name: Install and verify scanners
         shell: bash
@@ -51,4 +52,18 @@ jobs:
           for name in ("gitleaks-report.json", "semgrep-report.json", "dependency-check-report.json", "syft-sbom.json", "grype-report.json", "checkov-report.json"):
               with (summary.parent / name).open(encoding="utf-8") as f:
                   json.load(f)
+          PY
+      - name: Verify container image scanning
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker pull alpine:3.22
+          bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --scanner grype --image alpine:3.22 --report-dir "$RUNNER_TEMP/accidion-container-results"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "accidion-container-results"
+          report = max(root.rglob("grype-report.json"), key=lambda p: p.stat().st_mtime)
+          with report.open(encoding="utf-8") as f:
+              json.load(f)
           PY
