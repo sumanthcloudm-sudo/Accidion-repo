@@ -15,13 +15,13 @@ case "$(uname -m)" in
 esac
 
 usable_python() {
-  "$@" -c 'import os, sys; sys.exit(sys.version_info < (3, 10) or (sys.argv[1] == "windows" and os.name != "nt"))' \
+  "$@" -c 'import os, sys, ensurepip; sys.exit(not ((3, 10) <= sys.version_info[:2] <= (3, 13)) or (sys.argv[1] == "windows" and os.name != "nt"))' \
     "$system" >/dev/null 2>&1
 }
 
 find_python() {
   local candidate
-  for candidate in python3.12 python3.13 python3.11 python3.10 python3.14 python3 python; do
+  for candidate in python3.12 python3.13 python3.11 python3.10 python3 python; do
     if command -v "$candidate" >/dev/null && usable_python "$candidate"; then
       python_cmd=("$candidate")
       return
@@ -283,7 +283,7 @@ fi
 
 if ! find_python; then
   if $dry; then
-    printf 'Dry run (%s/%s): Python 3.10+ is missing. Project discovery needs Python.\n' "$system" "$arch"
+    printf 'Dry run (%s/%s): Python 3.10–3.13 with ensurepip is missing. Project discovery needs Python.\n' "$system" "$arch"
     exit 0
   fi
   if ! $install; then printf 'Python 3.10+ is required; installation disabled.\n' >&2; exit 2; fi
