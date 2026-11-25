@@ -6,9 +6,9 @@ Accidion discovers application source, build files, Java archives and supported 
 
 ## 2. Quick start: clone once, scan with one command
 
-Follow the [Quick Start](#quick-start---scan-your-completed-java-application) at the top of this guide after building and testing your application and checking the prerequisites in Section 4. Use an Ubuntu Bash terminal with Git already installed. Keep Accidion outside your application and replace example paths with your actual paths.
+Before running security scans, build and test your application and check the prerequisites in Section 4. Use an Ubuntu Bash terminal with Git already installed. Keep Accidion outside your application and replace example paths with your actual paths.
 
-Clone the kit only once. For subsequent scans, enter your application root and repeat the scan command from Quick Start. Use an organization-approved kit revision and review changes before updating it.
+Clone the kit only once. For subsequent scans, enter your application root and repeat the security scan command. Use an organization-approved kit revision and review changes before updating it.
 
 Use the approved local checkout workflow described in the [README](README.md#quick-start).
 
