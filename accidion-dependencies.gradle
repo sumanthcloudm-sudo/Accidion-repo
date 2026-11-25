@@ -21,4 +21,49 @@ gradle.projectsEvaluated {
             }
         }
     }
+
+    root.tasks.register("accidionDependencyPaths") {
+        doLast {
+            def destination = new File(root.property("accidionDependencyDirectory").toString())
+            def output = new File(destination.parentFile.parentFile,
+                                  "gradle-dependency-paths-${destination.name}.json")
+            def resolved = org.gradle.api.artifacts.result.ResolvedDependencyResult
+            def module = org.gradle.api.artifacts.component.ModuleComponentIdentifier
+            def projectComponent = org.gradle.api.artifacts.component.ProjectComponentIdentifier
+            def rows = [] as Set
+            root.allprojects.each { project ->
+                def source = root.projectDir.toPath().relativize(project.buildFile.toPath()).toString()
+                project.configurations.findAll {
+                    it.canBeResolved && it.name in ["runtimeClasspath", "compileClasspath"]
+                }.each { configuration ->
+                    configuration.incoming.resolutionResult.root.dependencies.findAll {
+                        resolved.isInstance(it) && !it.constraint &&
+                            (module.isInstance(it.selected.id) || projectComponent.isInstance(it.selected.id))
+                    }.each { direct ->
+                        def parent = direct.selected.moduleVersion
+                        def parentName = parent ? "${parent.group}:${parent.name}".toString() :
+                            direct.selected.id.displayName
+                        def pending = [[direct.selected, "Direct"]]
+                        def seen = [] as Set
+                        while (pending) {
+                            def (node, kind) = pending.remove(pending.size() - 1)
+                            if (!seen.add([node.id, kind])) {
+                                continue
+                            }
+                            def id = node.id
+                            if (module.isInstance(id)) {
+                                rows.add([component: "${id.group}:${id.module}".toString(),
+                                          version: id.version, kind: kind, source: source,
+                                          direct: parentName, directVersion: parent?.version])
+                            }
+                            node.dependencies.findAll { resolved.isInstance(it) && !it.constraint }.each {
+                                pending.add([it.selected, "Transitive"])
+                            }
+                        }
+                    }
+                }
+            }
+            output.setText(groovy.json.JsonOutput.toJson(rows), "UTF-8")
+        }
+    }
 }

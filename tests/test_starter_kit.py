@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -11,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import starter_findings as findings
 import starter_install
 import starter_kit as kit
 
@@ -300,7 +302,8 @@ public class Main {
                                       "vulnerabilities": [{"name": "CVE-2025-12345", "severity": "HIGH"}]}]}
         elif name == "syft":
             out = Path(args[-1].split("=", 1)[1])
-            data = {"bomFormat": "CycloneDX", "components": [{"name": "test", "bom-ref": "test"}]}
+            data = {"bomFormat": "CycloneDX", "components": [{"name": "test", "bom-ref": "test", "type": "library",
+                                                          "version": "1.0", "purl": "pkg:maven/test/test@1.0"}]}
         elif name == "grype":
             out = Path(args[args.index("--file") + 1])
             data = {"matches": [{"vulnerability": {"id": "CVE-2025-12346", "severity": "Critical",
@@ -350,7 +353,7 @@ public class Main {
                     options = kit.args_for(["--project-path", str(project), "--setup-only"])
                     self.assertEqual(kit.execute(options, system, arch), 0)
                     runner.assert_not_called()
-                    options = kit.args_for(["--project-path", str(project), "--build-image"])
+                    options = kit.args_for(["--project-path", str(project), "--build-image", "--details", "--verbose"])
                     self.assertEqual(kit.execute(options, system, arch), 0)
                 actual_order = [call.args[0][0] for call in runner.call_args_list
                                 if call.args[0][0] in kit.REPORTS]
@@ -374,7 +377,7 @@ public class Main {
                 issues = summary["issues"]
                 self.assertEqual([item["issue_number"] for item in issues], list(range(1, 12)))
                 self.assertEqual(len({item["issue_id"] for item in issues}), 11)
-                self.assertEqual(issues[0]["issue_name"], "Hardcoded API Key")
+                self.assertEqual(issues[0]["issue_name"], "Hardcoded API key")
                 self.assertEqual(issues[6]["issue_name"], "SQL Injection")
                 self.assertEqual(issues[6]["source_file"], "src/main/java/example/Main.java")
                 self.assertEqual(issues[6]["affected_filename"], "Main.java")
@@ -400,8 +403,36 @@ public class Main {
                     if path.suffix == ".json":
                         self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), (dict, list))
                 self.assertNotIn(self.SECRET, terminal.getvalue())
-                self.assertIn("Issue 11: Container Running as Root", terminal.getvalue())
-                self.assertIn("Syft: success | SBOM components: 1", terminal.getvalue())
+                output = terminal.getvalue()
+                self.assertIn("Report finding #11 | Checkov", output)
+                self.assertRegex(output, r"Syft: success \| \d+\.\d+s \| 1 component")
+                self.assertIn("Scanner execution: completed", output)
+                self.assertIn("Security validation: findings require review", output)
+                self.assertIn("CRITICAL 2 | HIGH 2 | MEDIUM 0 | LOW 0 | UNKNOWN 7", output)
+                self.assertRegex(output, r"Reported severity +Semgrep ERROR")
+                self.assertRegex(output, r"Application +External Java App")
+                self.assertIn(str(project), output)
+                self.assertRegex(output, r"Operating system +(?:Windows|Linux|macOS) \(")
+                self.assertRegex(output, r"Build system +Maven, Gradle")
+                self.assertRegex(output, r"Started \(UTC\) +\d{4}-\d{2}-\d{2}")
+                self.assertRegex(output, r"Applicable scanners +Gitleaks, Semgrep, OWASP Dependency-Check, Syft, Grype, Checkov")
+                self.assertLess(output.index("=== Accidion Security Scan ==="), output.index("Gitleaks: running"))
+                self.assertIn("Severity (grouped findings, deduplicated across scanners):", output)
+                self.assertIn("Scanning in progress", output)
+                self.assertRegex(output, r"(?m)^  library +maven +1$")
+                self.assertRegex(output, r"Component examples +test 1\.0")
+                headings = [output.rindex(f"=== {kit.NAMES.get(key, 'Syft')} - {title} ===")
+                            for key, title in findings.SCANNER_SECTIONS]
+                self.assertEqual(headings, sorted(headings))
+                self.assertGreater(output.index("=== Security Summary ===", headings[-1]), headings[-1])
+                self.assertRegex(output, r"JSON reports: .*security-summary\.json.*syft-sbom\.json")
+                self.assertNotIn("Related issue", output)
+                ends = headings[1:] + [output.index("=== Security Summary ===", headings[-1])]
+                sections = [output[start:end] for start, end in zip(headings, ends)]
+                for section, expected in zip(sections, ([1, 2, 3, 4, 5, 6], [1], [1], [], [1, 2], [1])):
+                    self.assertEqual([int(n) for n in re.findall(r"(?m)^Issue (\d+)$", section)], expected)
+                self.assertIn("Diagnostics", output)
+                self.assertLess(output.index("Semgrep: running"), output.index("Semgrep: success"))
                 original = json.loads((reports / "gitleaks-report.json").read_text())
                 self.assertEqual(original[0]["Secret"], "[REDACTED]")
                 self.assertEqual(original[0]["StartLine"], 1)
@@ -485,7 +516,7 @@ public class Main {
                  patch.object(kit, "run", side_effect=mock_run), \
                  patch.object(kit, "refresh_windows_path"), \
                  patch.object(kit, "private_run_path", side_effect=self.fake_private), \
-                 contextlib.redirect_stdout(io.StringIO()):
+                 contextlib.redirect_stdout(io.StringIO()) as terminal:
                 self.assertEqual(kit.execute(kit.args_for(["--project-path", str(project)]), "linux", "amd64"), 1)
             summary = json.loads((home / "reports/app/0/security-summary.json").read_text())
             self.assertEqual(summary["scanners"]["gitleaks"]["status"], "failed")
@@ -499,6 +530,335 @@ public class Main {
             self.assertEqual(summary["scanners"]["grype"]["status"], "success")
             self.assertEqual(summary["scanners"]["checkov"]["status"], "skipped")
             self.assertEqual(summary["installations"]["checkov"]["status"], "skipped")
+            self.assertRegex(terminal.getvalue(), r"Semgrep: failed \| \d+\.\d+s \| 1 finding")
+            self.assertIn("Security validation: incomplete coverage; findings require review", terminal.getvalue())
+            self.assertIn("SQL Injection", terminal.getvalue())
+
+    def test_terminal_groups_aliases_without_merging_distinct_packages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            cve = "CVE-2025-12345"
+            ghsa = "GHSA-abcd-1234-efgh"
+            package = "pkg:maven/example/library@1.0"
+            pom = project / "pom.xml"
+            pom.write_text("""<project>
+    <dependencies>
+        <dependency>
+            <groupId>example</groupId><artifactId>library</artifactId><version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>
+""", encoding="utf-8")
+            owasp = {"dependencies": [
+                {"fileName": path, "packages": [{"id": purl}],
+                 "vulnerabilities": [{"name": cve, "severity": "HIGH"}]}
+                for path, purl in (("library.jar", package), ("pom.xml", package + "?type=pom"),
+                                   ("other.jar", "pkg:maven/other/library@1.0"),
+                                   ("new.jar", "pkg:maven/example/library@1.1"))
+            ]}
+            grype = {"matches": [
+                {"vulnerability": {"id": identifier, "severity": severity, "fix": {"versions": [fix]}},
+                 "relatedVulnerabilities": related,
+                 "artifact": {"name": "library", "version": "1.0", "purl": purl,
+                              "locations": [{"path": "/temporary/dependencies/library.jar"}]}}
+                for identifier, severity, fix, related, purl in (
+                    (ghsa, "Critical", "1.2", [{"id": cve}], package),
+                    ("CVE-2025-67890", "Medium", "2.0", [], package),
+                    (cve, "Low", "2.0", [], package + "?classifier=tests"),
+                )
+            ]}
+            rows = [*findings.dependency_issues(owasp, project, terminal=True),
+                    *findings.grype_issues(grype, project, terminal=True)]
+            metadata = [row.pop("_terminal") for row in rows]
+            for index, row in enumerate(rows, 1):
+                row["issue_number"] = index
+            groups, counts = findings.terminal_groups(rows, metadata)
+            self.assertEqual(len(groups), 4)
+            self.assertEqual(counts, {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 1, "LOW": 1})
+            self.assertEqual(sum(len(evidence) for _, group in groups for evidence, _ in group), 7)
+            self.assertEqual(groups[0][1][0][1], {cve, ghsa})
+            output = []
+            _, unique, grouped = findings.terminal_summary(rows, metadata, project, {}, output.append)
+            self.assertEqual((unique, grouped), (4, 6))
+            rendered = "\n".join(output)
+            self.assertRegex(rendered, r"Source file +pom\.xml")
+            self.assertRegex(rendered, r"Line number\(s\) +3-5")
+            self.assertRegex(rendered, r"Dependency type +Direct")
+            self.assertIn(cve, rendered)
+            self.assertNotIn(ghsa, rendered)
+            self.assertNotIn("Reported fixed versions", rendered)
+            self.assertIn("Confirm the resolved version against each advisory", rendered)
+            self.assertNotIn("Related issue", rendered)
+            owasp, grype = rendered.split("=== Grype - Package Vulnerability Scanning ===")
+            self.assertRegex(owasp, r"(?m)^Issue 1$")
+            self.assertRegex(grype, r"(?m)^Issue 1$")
+            self.assertRegex(grype, r"Scanner +Grype")
+            self.assertEqual(rendered.count("Issue name          Vulnerable package: example:library\n"), 3)
+            output.clear()
+            findings.terminal_summary(rows, metadata, project, {}, output.append, details=True)
+            detail = "\n".join(output)
+            self.assertIn(cve, detail)
+            self.assertIn(ghsa, detail)
+            self.assertIn("Reported fixed versions: 1.2", detail)
+            self.assertIn("Reported fixed versions: 2.0", detail)
+            self.assertNotIn("/temporary/", rendered)
+            self.assertNotIn("Finding #", rendered)
+
+    def test_dependency_paths_include_direct_and_multiple_transitive_parents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "app"
+            project.mkdir()
+            pom = project / "pom.xml"
+            pom.write_text("""<project>
+    <dependencies>
+        <dependency><groupId>example</groupId><artifactId>starter</artifactId></dependency>
+    </dependencies>
+</project>
+""", encoding="utf-8")
+            (project / "build.gradle").write_text(
+                "dependencies {\n    implementation 'example:gradle-starter:2.1'\n}\n", encoding="utf-8")
+            deps = root / "dependencies"
+            (deps / "0").mkdir(parents=True)
+
+            def node(artifact, *children):
+                return {"groupId": "example", "artifactId": artifact, "version": "1.0", "children": children}
+
+            maven_tree = deps / "0/maven-dependency-tree.json"
+            maven_tree.write_text(
+                json.dumps(node("app", node("starter", node("intermediate", node("library")))))
+                + "\n" + json.dumps(node("app", node("second", node("library")), node("library"))),
+                encoding="utf-8",
+            )
+            (root / "gradle-dependency-paths-1.json").write_text(json.dumps([{
+                "component": "example:library", "version": "1.0", "kind": "Transitive",
+                "source": "build.gradle", "direct": "example:gradle-starter", "directVersion": "2.1",
+            }]), encoding="utf-8")
+            paths = kit.dependency_contexts(
+                project, [("maven", project, ["mvn"]), ("gradle", project, ["gradle"])],
+                deps, self.fail, [pom],
+            )
+            output = []
+            issue = findings.new_issue("dependency-check", affected_dependency="example:library",
+                                       installed_version="1.0")
+            findings.terminal_summary([issue], [{"package": "pkg:maven/example/library@1.0"}],
+                                      project, paths, output.append)
+            rendered = "\n".join(output)
+            self.assertRegex(rendered, r"Dependency type +Direct / Transitive")
+            self.assertRegex(rendered, r"Source file +pom\.xml")
+            self.assertRegex(rendered, r"Source file +build\.gradle")
+            self.assertRegex(rendered, r"Line number\(s\) +2")
+            for parent in ("example:starter:1.0", "example:second:1.0", "example:gradle-starter:2.1"):
+                self.assertIn(parent, rendered)
+            self.assertNotIn("example:intermediate", rendered)
+            self.assertIn("update the version, property, or imported BOM", rendered)
+            self.assertIn("update its declaration or version catalog", rendered)
+            self.assertRegex(rendered, r"(?m)^  Command +gradle dependencyInsight --dependency library")
+            self.assertRegex(rendered, r"(?m)^  Working directory +\. \(project directory\)\n  Command +mvn")
+            self.assertRegex(rendered, r"Severity +UNKNOWN")
+
+    def test_remediation_keeps_source_tools_visible_and_consolidates_matching_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            rows = [findings.new_issue("grype", affected_dependency=f"example:library-{index}",
+                                      installed_version="1.0", severity="MEDIUM",
+                                      issue_description="Detailed advisory jargon")
+                    for index in range(12)]
+            metadata = [{"package": f"pkg:maven/example/library-{index}@1.0"} for index in range(12)]
+            rows.extend([
+                findings.new_issue("semgrep", affected_dependency="example:library-0", installed_version="1.0",
+                                   severity="ERROR", source_file="App.java", start_line=10, cwe_id=["CWE-89"],
+                                   cve_id=["CVE-2025-11111"]),
+                findings.new_issue("gitleaks", rule_id="hardcoded-token", source_file="app.properties", start_line=5),
+                findings.new_issue("gitleaks", rule_id="hardcoded-token", source_file="app.properties", start_line=9),
+                findings.new_issue("checkov", issue_name="Container Running as Root",
+                                   rule_id="CKV_DOCKER_3", source_file="Dockerfile", start_line=4),
+            ])
+            metadata.extend([{}, {}, {}, {}])
+            for number, row in enumerate(rows, 1):
+                row["issue_number"] = number
+            output = []
+            findings.terminal_summary(rows, metadata, project, {}, output.append)
+            rendered = "\n".join(output)
+            self.assertEqual(rendered.count("Issue name          Vulnerable package: example:library-0"), 2)
+            self.assertEqual(rendered.count("Hardcoded authentication token"), 2)
+            self.assertRegex(rendered, r"Source file +App\.java")
+            self.assertRegex(rendered, r"(?m)Line number\(s\) +5$")
+            self.assertRegex(rendered, r"(?m)Line number\(s\) +9$")
+            self.assertRegex(rendered, r"Source file +Dockerfile")
+            self.assertIn("Set USER to that account", rendered)
+            self.assertIn("docker exec <container> id -u", rendered)
+            self.assertIn("Check revocation if applicable", rendered)
+            self.assertRegex(rendered, r"Severity +UNKNOWN")
+            self.assertIn("CVE-2025-11111", rendered)
+            output.clear()
+            findings.terminal_summary(rows, metadata, project, {}, output.append, details=True)
+            self.assertIn("Advisory: CVE-2025-11111", "\n".join(output))
+
+    def test_technology_specific_issue_guidance(self):
+        rows = [
+            findings.new_issue("semgrep", issue_name="SQL injection", source_file="Query.java",
+                               start_line=12, rule_id="java-sql-injection", severity="ERROR"),
+            findings.new_issue("semgrep", issue_name="Unsafe dynamic SQL", source_file="deploy.sql",
+                               start_line=6, rule_id="insecure-dynamic-sql", severity="ERROR"),
+            findings.new_issue("checkov", issue_name="Unrestricted egress", source_file="main.tf",
+                               start_line=4, end_line=8, rule_id="CKV_AWS_382"),
+            findings.new_issue("gitleaks", issue_name="Hardcoded token", source_file="tests/fixture.env",
+                               rule_id="hardcoded-token"),
+            findings.new_issue("gitleaks", issue_name="Hardcoded token", source_file="deployment.env",
+                               rule_id="hardcoded-token"),
+        ]
+        output = []
+        findings.terminal_summary(rows, [{} for _ in rows], Path.cwd(), {}, output.append)
+        text = "\n".join(output)
+        java, sql = text.split("Unsafe dynamic SQL", 1)
+        self.assertIn("JDBC PreparedStatement", java)
+        self.assertNotIn("PreparedStatement", sql)
+        self.assertIn("sp_executesql", sql)
+        self.assertRegex(sql, r"Line number\(s\) +4-8")
+        self.assertIn("Replace the unrestricted egress rule", sql)
+        self.assertIn("Possible test credential based on the path", java)
+        self.assertIn("Potential credential. Validity is unverified.", java)
+
+    def test_issue_numbers_restart_and_equivalent_rows_remain_in_details(self):
+        rows, metadata = [], []
+        for scanner in ("gitleaks", "semgrep", "dependency-check", "grype", "checkov"):
+            for number in (1, 1, 2):
+                dependency = scanner in {"dependency-check", "grype"}
+                rows.append(findings.new_issue(
+                    scanner, issue_number=len(rows) + 1, issue_name="Test rule",
+                    source_file="sample.txt", start_line=number, rule_id=f"rule-{number}",
+                    affected_dependency=f"example:lib-{number}" if dependency else None,
+                    installed_version="1" if dependency else None,
+                ))
+                metadata.append({"package": f"pkg:maven/example/lib-{number}@1",
+                                 "aliases": [f"CVE-2025-1000{number}"]} if dependency else {})
+        output = []
+        _, unique, grouped = findings.terminal_summary(
+            rows, metadata, Path.cwd(), {}, output.append, details=True)
+        self.assertEqual((unique, grouped), (8, 10))
+        rendered = "\n".join(output)
+        for key, title in findings.SCANNER_SECTIONS:
+            if key == "syft":
+                continue
+            label = kit.NAMES[key]
+            section = rendered.split(f"=== {label} - {title} ===", 1)[1].split("===", 1)[0]
+            self.assertEqual(re.findall(r"(?m)^Issue (\d+)$", section), ["1", "2"])
+            self.assertRegex(section, r"Raw findings +3")
+            self.assertRegex(section, r"Grouped findings +2")
+            self.assertEqual(section.count("Report finding #"), 3)
+            self.assertRegex(section, rf"Scanner +{re.escape(label)}")
+        self.assertNotIn("Related issue", rendered)
+
+    def test_infrastructure_rules_provide_resource_edits_and_verification(self):
+        cases = {
+            "CKV2_AWS_6": "aws_s3_bucket_public_access_block",
+            "CKV_AWS_53": "block_public_acls = true",
+            "CKV_AWS_54": "block_public_policy = true",
+            "CKV_AWS_55": "ignore_public_acls = true",
+            "CKV_AWS_56": "restrict_public_buckets = true",
+            "CKV_AWS_18": "aws_s3_bucket_logging",
+            "CKV_AWS_19": "aws_s3_bucket_server_side_encryption_configuration",
+            "CKV_AWS_145": "aws:kms",
+            "CKV_AWS_21": "aws_s3_bucket_versioning",
+            "CKV2_AWS_61": "aws_s3_bucket_lifecycle_configuration",
+            "CKV_AWS_300": "abort_incomplete_multipart_upload",
+            "CKV_AWS_144": "aws_s3_bucket_replication_configuration",
+            "CKV2_AWS_62": "aws_s3_bucket_notification",
+            "CKV_AWS_24": "approved CIDRs",
+            "CKV_AWS_382": "Replace the unrestricted egress rule",
+            "CKV2_AWS_5": "Remove the group from configuration if it is unused",
+            "CKV_DOCKER_2": "Add a HEALTHCHECK",
+            "CKV_DOCKER_3": "Set USER",
+            "CKV_DOCKER_8": "Set USER",
+        }
+        for rule, edit in cases.items():
+            with self.subTest(rule=rule):
+                filename = "Dockerfile" if rule.startswith("CKV_DOCKER") else "main.tf"
+                issue = findings.new_issue("checkov", rule_id=rule, issue_name=rule, source_file=filename)
+                _, problem, risk, steps, verify = findings.source_remediation(issue)
+                self.assertTrue(problem)
+                self.assertTrue(risk)
+                self.assertIn(edit, " ".join(steps))
+                commands = findings.verification_commands(Path.cwd(), [(filename, None, None)], None, rule)
+                self.assertTrue(any(command.startswith("docker " if filename == "Dockerfile" else "terraform validate")
+                                    for _, command in commands))
+                self.assertTrue(verify)
+
+    def test_dependency_titles_risks_and_fix_status_use_scanner_evidence(self):
+        package = {"name": "library", "version": "1.0", "purl": "pkg:maven/example/library@1.0"}
+        long_detail = "Advisory detail " * 24
+        report = {"matches": [
+            {"artifact": package, "vulnerability": {"id": "CVE-2025-10001",
+                "title": "Authentication bypass in library",
+                "description": "An attacker can bypass authentication. " + long_detail,
+                "fix": {"state": "fixed", "versions": ["1.2"]}}},
+            {"artifact": package, "vulnerability": {"id": "CVE-2025-10002",
+                "description": "An attacker can bypass authentication. " + long_detail,
+                "fix": {"state": "not-fixed"}}},
+            {"artifact": package, "vulnerability": {"id": "CVE-2025-10003",
+                "description": long_detail}},
+        ]}
+        rows = list(findings.grype_issues(report, Path.cwd(), terminal=True))
+        evidence = [row.pop("_terminal") for row in rows]
+        output = []
+        findings.terminal_summary(rows, evidence, Path.cwd(), {}, output.append)
+        rendered = "\n".join(output)
+        self.assertIn("Authentication bypass in library", rendered)
+        self.assertEqual(rendered.count("An attacker can bypass authentication."), 1)
+        self.assertNotIn(long_detail.strip(), rendered)
+        self.assertRegex(rendered, r"Installed version +1\.0")
+        self.assertRegex(rendered, r"Reported fixes +1\.2")
+        for status in ("1 fix reported", "1 reported unfixed", "1 availability unknown"):
+            self.assertIn(status, rendered)
+        output.clear()
+        findings.terminal_summary(rows, evidence, Path.cwd(), {}, output.append, details=True)
+        self.assertIn(long_detail.strip(), "\n".join(output))
+        self.assertIn("Reported fix state: not-fixed", "\n".join(output))
+
+    def test_verification_commands_use_manifest_directories(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = Path(root)
+            for filename in ("gradlew", "gradlew.bat"):
+                (project / filename).touch()
+            locations = [("java/module/pom.xml", 3, 5), ("modules/service/build.gradle.kts", 7, 8)]
+            commands = findings.verification_commands(
+                project, locations, ("maven", "example:library", "1", ()), None)
+            self.assertIn(("java/module", "mvn dependency:tree -Dincludes=example:library"), commands)
+            wrapper = "gradlew.bat" if os.name == "nt" else "gradlew"
+            self.assertIn(("modules/service", f"../../{wrapper} dependencyInsight --dependency library "
+                           "--configuration runtimeClasspath"), commands)
+            commands = findings.verification_commands(project, [("infra/main.tf", 4, 8)], None, "CKV2_AWS_5")
+            self.assertIn(("infra", "terraform validate"), commands)
+            self.assertIn(("infra if standalone, otherwise run from its Terraform calling root", "terraform plan"), commands)
+
+    def test_no_findings_and_optional_skips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "app"
+            project.mkdir()
+
+            def ensure(installer, name, **kwargs):
+                installer.records[name] = {"status": "reused", "version": "1.0"}
+                return [name]
+
+            def empty_report(cmd, **kwargs):
+                self.assertEqual(cmd[0], "gitleaks")
+                Path(cmd[cmd.index("--report-path") + 1]).write_text("[]", encoding="utf-8")
+
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(root / "data")}), \
+                 patch.object(kit.Installer, "ensure", ensure), \
+                 patch.object(kit, "run", side_effect=empty_report), \
+                 patch.object(kit, "refresh_windows_path"), \
+                 patch.object(kit, "private_run_path", side_effect=self.fake_private), \
+                 contextlib.redirect_stdout(io.StringIO()) as terminal:
+                self.assertEqual(kit.execute(kit.args_for(["--project-path", str(project)]), "linux", "amd64"), 0)
+            rendered = terminal.getvalue()
+            self.assertIn("Semgrep: skipped", rendered)
+            self.assertIn("Security validation: no findings reported by completed scans", rendered)
+            self.assertIn("CRITICAL 0 | HIGH 0 | MEDIUM 0 | LOW 0 | UNKNOWN 0", rendered)
+            self.assertNotIn("Diagnostics", rendered)
+
 
 class BootstrapTests(unittest.TestCase):
     pin = "0123456789abcdef" * 2 + "01234567"

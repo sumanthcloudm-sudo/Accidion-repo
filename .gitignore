@@ -40,3 +40,5 @@ __pycache__/
 *.tfstate.*
 *.tfvars
 *.tfvars.json
+*.bak
+security-debug.log
