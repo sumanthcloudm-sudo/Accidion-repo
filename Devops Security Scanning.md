@@ -30,6 +30,16 @@ When you run the launcher against your own application, Accidion:
 
 Detection does not mean automatic remediation. Developers review findings, update their **own application**, test it, and rescan.
 
+### Supporting scripts
+
+| File | Purpose |
+| --- | --- |
+| `security-scan.sh` | Entry point, platform detection and input configuration |
+| `starter_kit.py` | Project discovery, scanner execution and report generation |
+| `starter_install.py` | Tool verification and permitted provisioning |
+| `starter_findings.py` | Consolidated findings and remediation guidance |
+| `security-scan.properties` | Optional application root, output path and scanner settings |
+
 ## 2. Security scanning launcher: security-scan.sh
 
 **Main launcher:** [security-scan.sh](security-scan.sh)
@@ -50,13 +60,13 @@ You can also specify the application explicitly from another directory:
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --project-path "/path/to/my-java-app"
 ```
 
-### Scanner execution commands
+### Scanner execution commands — choose one per run
 
-After cloning the kit (Section 3), enter your Java application root containing `pom.xml`. Accidion automatically discovers Maven and applicable application files. Choose one command below based on what you want to scan. These examples assume default properties unless overridden by the command.
+After cloning the kit (Section 3), enter your Java application root containing `pom.xml`. Accidion automatically discovers Maven and applicable application files. Choose one command below based on what you want to scan. These examples assume default properties unless overridden by the command. Run only the command you need today; there is no requirement to run every scanner each time. All commands use Bash/Git Bash on the developer's laptop, from the application root.
 
 #### Complete security scan
 
-Runs all applicable scanners against your application. This is the recommended normal scan.
+When: before integration or release. Where: application root. Reports: all applicable scanner reports, summary and log. Docker image scanning is opt-in.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all
@@ -64,7 +74,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all
 
 #### Gitleaks — secret scanning
 
-Checks for potential exposed credentials and secrets.
+When: before committing or after configuration changes. Where: application root. Report: `gitleaks-report.json`.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks
@@ -72,7 +82,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks
 
 #### Semgrep — source-code security
 
-Checks Java source and supported files against static security rules.
+When: after source-code changes. Where: application root. Report: `semgrep-report.json`.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner semgrep
@@ -80,7 +90,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner semgrep
 
 #### OWASP Dependency-Check — Maven dependency security
 
-Checks applicable Java dependencies for known vulnerabilities.
+When: after changing Maven dependencies or when only dependency findings are needed. Where: Maven root containing `pom.xml`. Accidion detects Maven and attempts dependency resolution. Report: `dependency-check-report.json`; Maven dependency-tree JSON may also be produced.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner dependency-check
@@ -88,7 +98,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner dependency-check
 
 #### Syft — SBOM generation
 
-Generates an inventory of application components.
+When: a component inventory is needed. Where: application root. Report: `syft-sbom.json` (CycloneDX JSON, not a vulnerability list).
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner syft
@@ -96,7 +106,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner syft
 
 #### Grype — package vulnerability scanning
 
-Checks known package vulnerabilities; Syft runs automatically when required.
+When: application package vulnerabilities need checking. Where: application root. Report: `grype-report.json`; Syft runs as a prerequisite when needed and may generate `syft-sbom.json`.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype
@@ -104,7 +114,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype
 
 #### Checkov — infrastructure security
 
-Checks supported infrastructure files and Dockerfiles, when present.
+When: infrastructure or Dockerfile changes. Where: application root with supported files. Report: `checkov-report.json` if applicable.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner checkov
@@ -112,13 +122,15 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner checkov
 
 #### Multiple scanners
 
-Runs the selected scanner combination.
+When: only a subset of checks is needed. Where: application root. Reports: the selected scanner outputs and any required prerequisite outputs.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks,semgrep
 ```
 
 #### Docker image only
+
+When: you already built or pulled an image and want image vulnerabilities only. Where: developer terminal with the application root selected and Docker running. No full Java/Maven scan is needed. Report: `grype-report.json`.
 
 List locally available images:
 
@@ -141,6 +153,8 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --build-im
 Only Grype runs for these Docker-only commands. Docker must be installed, running and accessible.
 
 #### Complete scan including Docker
+
+When: before releasing both the application and its image. Where: application root. Reports: applicable application reports plus image findings; `grype-sbom-report.json` may additionally contain package findings.
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all --image my-app:latest
@@ -170,7 +184,7 @@ my-java-app/
   infrastructure/            # optional
 ```
 
-Your application can use Maven or Gradle. Finish its normal build and tests before scanning. Your real source and build files remain in **your own application directory**.
+Your application can use Maven or Gradle. Finish its normal build and tests before scanning. For Maven, open the application root and run `mvn clean verify` if Maven and the appropriate JDK are installed. Your real source and build files remain in **your own application directory**.
 
 ### Step 2 — Check prerequisites on your laptop
 
@@ -211,15 +225,40 @@ For Linux or macOS:
 cd "$HOME/projects/my-java-app"
 ```
 
+Verify the current folder using:
+
+```bash
+pwd
+ls
+```
+
+For Maven, look for `pom.xml`.
+
 **Replace the example path with the actual path to your Java application.** The folder you enter is what Accidion scans. If you do not want to change directories, use `--project-path` instead.
 
 ### Step 5 — Run one security scanning command
 
-From your Java application root:
+From your Java application root, choose **one** of the following commands.
+
+Complete scan (default properties):
 
 ```bash
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
 ```
+
+Maven dependency scan only:
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner dependency-check
+```
+
+Existing Docker image only (replace the image name and tag):
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --image my-app:latest
+```
+
+For other individual scanners or combinations, use Section 2.
 
 Accidion discovers the applicable project files, checks required tools, runs applicable scanners, and prints progress and the **exact report directory**.
 
@@ -261,7 +300,7 @@ BUILD_IMAGE=false
 | `DOCKER_IMAGE` | Existing authorized local Docker image name | Empty; no explicit image requested |
 | `BUILD_IMAGE` | Build and scan a Docker image | `false` |
 
-Example for a Linux or macOS developer who wants fixed paths:
+Example for a Linux developer who wants fixed paths (macOS typically uses `/Users/yourname` instead of `/home/yourname`):
 
 ```properties
 PROJECT_ROOT=/home/yourname/projects/my-java-app
@@ -272,6 +311,8 @@ BUILD_IMAGE=false
 ```
 
 Replace those paths with the actual application and report paths. On Windows, use the paths appropriate to Git Bash/your filesystem instead; do not copy Linux paths to Windows. **The report directory must be outside your application directory** to avoid accidentally scanning or committing sensitive results.
+
+To configure Maven-only scanning as a recurring default, use `SCANNERS=dependency-check`, `DOCKER_IMAGE=` and `BUILD_IMAGE=false`. For Docker-only scanning, use `SCANNERS=grype`, `DOCKER_IMAGE=my-app:latest` and `BUILD_IMAGE=false`. Run the same launcher after saving. For occasional scanner selection, keep default properties and use command-line flags instead. Clear configured Docker properties before switching to a scanner that does not include Grype.
 
 Alternatively, keep properties at their defaults and pass values directly:
 
@@ -303,6 +344,58 @@ A new scan creates a separate run directory. Your application source is **not au
 | `run.log` | Redacted execution diagnostics and scanner/build errors |
 
 An image scan alongside package scanning can also produce `grype-sbom-report.json`; a Maven scan may produce a dependency-tree JSON file. **Only reports produced by applicable, completed stages may be present.** A missing file may indicate an unselected, skipped, or failed scanner.
+
+### Complete versus individual scanner reports
+
+Every completed scan normally generates `security-summary.json` and `run.log`. Native scanner reports are generated only for executed stages that produce output. Unselected stages do not generate their native reports.
+
+| Scan selection | Expected native scanner reports (in addition to summary and log) |
+| --- | --- |
+| `--scanner all` | All applicable scanner outputs: Gitleaks, Semgrep, Dependency-Check, Syft, Grype and Checkov |
+| `--scanner dependency-check` | `dependency-check-report.json` (and possible Maven dependency-tree JSON) |
+| `--scanner gitleaks` | `gitleaks-report.json` |
+| `--scanner semgrep` | `semgrep-report.json` |
+| `--scanner syft` | `syft-sbom.json` |
+| `--scanner grype` | `grype-report.json` and required Syft SBOM when applicable |
+| `--scanner checkov` | `checkov-report.json` when applicable |
+| `--scanner grype --image my-app:latest` | `grype-report.json` for the image only |
+| `--scanner grype --build-image` | `grype-report.json` for the built image |
+| `--scanner gitleaks,semgrep` | Gitleaks and Semgrep reports |
+| `--scanner all --image my-app:latest` | Applicable scanner outputs plus image findings and possible `grype-sbom-report.json` |
+
+Example complete run (all six applicable stages produce reports):
+
+```text
+scan-<timestamp>-<id>/
+  security-summary.json
+  gitleaks-report.json
+  semgrep-report.json
+  dependency-check-report.json
+  syft-sbom.json
+  grype-report.json
+  checkov-report.json
+  run.log
+```
+
+Example Docker-only run:
+
+```text
+scan-<timestamp>-<id>/
+  security-summary.json
+  grype-report.json
+  run.log
+```
+
+Example Maven-only run:
+
+```text
+scan-<timestamp>-<id>/
+  security-summary.json
+  dependency-check-report.json
+  run.log
+```
+
+Maven dependency metadata may also be generated. Grype package scanning has a Syft prerequisite; therefore an individual selection is not always strictly one native report. A full scan does not guarantee six outputs if a scanner is inapplicable or fails. Check status and reason in the summary.
 
 ### How a developer uses the findings
 
