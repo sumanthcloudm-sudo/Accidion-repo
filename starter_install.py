@@ -72,7 +72,11 @@ def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,),
 
 
 def fetch(url, output=None, algorithm="sha256"):
-    request = urllib.request.Request(url, headers={"User-Agent": "accidion-starter-kit"})
+    headers = {"User-Agent": "accidion-starter-kit"}
+    # Use the CI token only for GitHub release metadata, never package downloads.
+    if url.startswith("https://api.github.com/repos/") and os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = "Bearer " + os.environ["GITHUB_TOKEN"]
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         if output is None:
             return response.read(4 * 1024 * 1024 + 1)
