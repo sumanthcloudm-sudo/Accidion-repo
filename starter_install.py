@@ -61,11 +61,41 @@ def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,),
                 raise RuntimeError("A Windows batch argument contains an unsafe shell character")
             quoted = " ".join(f'"{arg}"' for arg in args)
             args = f'"{os.environ["COMSPEC"]}" /d /v:off /s /c "{quoted}"'
-    result = subprocess.run(
-        args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
-        stdout=subprocess.PIPE if capture else log, stderr=subprocess.STDOUT,
-        timeout=timeout, encoding="utf-8", errors="replace",
-    )
+    import threading
+
+    finished = threading.Event()
+    started = time.monotonic()
+
+    def heartbeat():
+        while not finished.wait(30):
+            elapsed = int(time.monotonic() - started)
+            print(
+                f"  Operation still running | Elapsed: {elapsed}s",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    worker = None
+    if not capture and log is not None:
+        worker = threading.Thread(target=heartbeat, daemon=True)
+        worker.start()
+
+    try:
+        result = subprocess.run(
+            args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
+            stdout=subprocess.PIPE if capture else log,
+            stderr=subprocess.STDOUT,
+            timeout=timeout, encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Command exceeded the {timeout}-second timeout. "
+            "Review connectivity, build configuration and scanner diagnostics."
+        ) from None
+    finally:
+        finished.set()
+        if worker is not None:
+            worker.join()
     if result.returncode not in accepted:
         if capture and log is not None and result.stdout:
             log.write(result.stdout + "\n")
