@@ -346,4 +346,11 @@ fi
 
 runner="$kit_dir/starter_kit.py"
 if [[ $system == windows ]]; then runner="$(cygpath -am "$runner")"; fi
-exec "${python_cmd[@]}" "$runner" "$@"
+printf 'Application directory: %s\n' "$project" >&2
+printf 'Toolkit directory: %s\n' "$kit_dir" >&2
+
+if [[ $system == windows ]]; then
+  project="$(cygpath -am "$project")"
+fi
+
+exec "${python_cmd[@]}" "$runner" "$@" --project-path="$project"
