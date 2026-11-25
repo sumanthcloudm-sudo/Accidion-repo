@@ -50,24 +50,109 @@ You can also specify the application explicitly from another directory:
 bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --project-path "/path/to/my-java-app"
 ```
 
-Useful options:
+### Scanner execution commands
 
-| Option | Purpose |
-| --- | --- |
-| `--scanner all` | Run all applicable scanner types (default) |
-| `--scanner gitleaks,semgrep` | Run a selected combination |
-| `--project-path PATH` | Select the application root instead of the current directory |
-| `--report-dir PATH` | Select a private report parent directory **outside** the application |
-| `--dry-run` | Preview project discovery without a security scan |
-| `--setup-only` | Prepare applicable tools without scanning |
-| `--no-install` | Do not install missing kit-managed tools |
-| `--details` | Display more finding evidence in the terminal |
-| `--verbose` | Display scanner and dependency-resolution diagnostics |
-| `--image IMAGE` | Include scanning an existing local Docker image |
-| `--build-image` | Build and scan an application Docker image if a suitable Dockerfile exists |
-| `--help` | Show launcher options |
+After cloning the kit (Section 3), enter your Java application root containing `pom.xml`. Accidion automatically discovers Maven and applicable application files. Choose one command below based on what you want to scan. These examples assume default properties unless overridden by the command.
 
-Docker image scanning requires Docker to be installed, running, and accessible. Use only images you are authorized to scan.
+#### Complete security scan
+
+Runs all applicable scanners against your application. This is the recommended normal scan.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all
+```
+
+#### Gitleaks — secret scanning
+
+Checks for potential exposed credentials and secrets.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks
+```
+
+#### Semgrep — source-code security
+
+Checks Java source and supported files against static security rules.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner semgrep
+```
+
+#### OWASP Dependency-Check — Maven dependency security
+
+Checks applicable Java dependencies for known vulnerabilities.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner dependency-check
+```
+
+#### Syft — SBOM generation
+
+Generates an inventory of application components.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner syft
+```
+
+#### Grype — package vulnerability scanning
+
+Checks known package vulnerabilities; Syft runs automatically when required.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype
+```
+
+#### Checkov — infrastructure security
+
+Checks supported infrastructure files and Dockerfiles, when present.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner checkov
+```
+
+#### Multiple scanners
+
+Runs the selected scanner combination.
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks,semgrep
+```
+
+#### Docker image only
+
+List locally available images:
+
+```bash
+docker images
+```
+
+Scan the selected image (replace the example name and tag with your own):
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --image my-app:latest
+```
+
+Alternatively, build and scan the application image using its Dockerfile:
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --build-image
+```
+
+Only Grype runs for these Docker-only commands. Docker must be installed, running and accessible.
+
+#### Complete scan including Docker
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all --image my-app:latest
+```
+
+Or build the application image as part of the complete scan:
+
+```bash
+bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all --build-image
+```
+
+For all available optional arguments, use `bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --help`.
 
 ## 3. Steps to run Accidion on your own Java application
 
