@@ -1,0 +1,54 @@
+name: Cross-platform scanner verification
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Validate launcher and Python syntax
+        shell: bash
+        run: |
+          bash -n security-scan.sh python-bootstrap.sh
+          python -m compileall -q starter_install.py starter_kit.py
+      - name: Create isolated Java and IaC test project
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/accidion-fixture/src/main/java"
+          printf '%s\n' 'class Example { public static void main(String[] args) {} }' > "$RUNNER_TEMP/accidion-fixture/src/main/java/Example.java"
+          printf '%s\n' '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>example</groupId><artifactId>fixture</artifactId><version>1.0</version></project>' > "$RUNNER_TEMP/accidion-fixture/pom.xml"
+          printf '%s\n' 'FROM alpine:3.22' > "$RUNNER_TEMP/accidion-fixture/Dockerfile"
+      - name: Install and verify scanners
+        shell: bash
+        run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --setup-only
+      - name: Execute all applicable scanners
+        shell: bash
+        run: bash security-scan.sh --project-path "$RUNNER_TEMP/accidion-fixture" --report-dir "$RUNNER_TEMP/accidion-results"
+      - name: Verify JSON output
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "accidion-results"
+          summary = max(root.rglob("security-summary.json"), key=lambda p: p.stat().st_mtime)
+          for name in ("gitleaks-report.json", "semgrep-report.json", "dependency-check-report.json", "syft-sbom.json", "grype-report.json", "checkov-report.json"):
+              with (summary.parent / name).open(encoding="utf-8") as f:
+                  json.load(f)
+          PY
