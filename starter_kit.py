@@ -2,6 +2,7 @@
 import argparse
 import csv
 from collections import Counter, defaultdict
+import functools
 import json
 import os
 import re
@@ -255,7 +256,16 @@ def gradle_source_label(project, source, coordinate):
     return source_label(source, matches[0]) if len(matches) == 1 else source
 
 
-def dependency_contexts(project, builds, deps, diagnostic, poms):
+def maven_declaration_lookup():
+    @functools.cache
+    def find_poms(root):
+        return tuple(root.rglob("pom.xml"))
+
+    return functools.cache(functools.partial(find_maven_declaration, find_poms=find_poms))
+
+
+def dependency_contexts(project, builds, deps, diagnostic, poms, *,
+                        maven_reports=None, declaration_lookup=find_maven_declaration):
     modules = defaultdict(list)
     for pom in poms:
         try:
@@ -281,7 +291,11 @@ def dependency_contexts(project, builds, deps, diagnostic, poms):
                 continue
 
             tree = target / "maven-dependency-tree.json"
-            for data in maven_trees(tree):
+            trees = maven_trees(tree) if maven_reports is None else maven_reports.get(tree)
+            if trees is None:
+                diagnostic(f"{family} dependency path evidence unavailable (FileNotFoundError)")
+                continue
+            for data in trees:
                 candidates = [pom for pom in modules[data.get("groupId"), data.get("artifactId")]
                               if pom.is_relative_to(root)]
                 pom = candidates[0] if len(candidates) == 1 else root / "pom.xml"
@@ -290,7 +304,7 @@ def dependency_contexts(project, builds, deps, diagnostic, poms):
                     version = direct["version"]
                     key = pom, coordinate, version
                     if key not in declarations:
-                        _, start, end = find_maven_declaration(
+                        _, start, end = declaration_lookup(
                             pom.parent, coordinate, version, declaration_pom=pom)
                         declarations[key] = source_label(pom.relative_to(project).as_posix(), start, end)
                     nodes = [(direct, "Direct")]
@@ -299,34 +313,48 @@ def dependency_contexts(project, builds, deps, diagnostic, poms):
                         component = f"{node['groupId']}:{node['artifactId']}"
                         contexts[component, node["version"]].add((kind, coordinate, version, declarations[key]))
                         nodes.extend((child, "Transitive") for child in node.get("children") or [])
+            if maven_reports is not None and trees.error is not None:
+                diagnostic(f"{family} dependency path evidence unavailable ({trees.error})")
         except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
             diagnostic(f"{family} dependency path evidence unavailable ({type(error).__name__})")
     return {key: sorted(values) for key, values in contexts.items()}
 
 
-def build_maven_index(report_dir):
-    """Index dependency paths once per scan, preserving traversal order."""
-    index = defaultdict(list)
-    seen = defaultdict(set)
+class MavenTreeReport:
+    """Retain parsed trees for terminal evidence, including any prefix before an error."""
 
-    def walk(node, chain):
-        current = (f"{node.get('groupId')}:{node.get('artifactId')}", node.get("version"))
-        chain = chain + (current,)
-        if len(chain) > 1 and chain not in seen[current]:
-            seen[current].add(chain)
-            index[current].append(chain)
-        for child in node.get("children") or []:
-            walk(child, chain)
-
-    for tree in sorted(report_dir.glob("maven-dependency-tree-*.json")):
+    def __init__(self, path):
+        self.trees = []
+        self.error = None
         try:
-            walk(json.loads(tree.read_text(encoding="utf-8")), ())
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-    return index
+            self.trees.extend(maven_trees(path))
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            self.error = type(error).__name__
+
+    def __iter__(self):
+        return iter(self.trees)
 
 
-def enrich_maven_finding(issue, project, report_dir, index=None, declarations=None):
+def index_maven_dependencies(trees):
+    paths = defaultdict(dict)
+    for tree in trees:
+        pending = [(tree, ())]
+        while pending:
+            node, ancestors = pending.pop()
+            try:
+                coordinate = f"{node.get('groupId')}:{node.get('artifactId')}"
+                version = node.get("version")
+                chain = (*ancestors, (coordinate, version))
+                if ancestors:
+                    paths[coordinate, version][chain] = None
+                pending.extend((child, chain) for child in reversed(node.get("children") or []))
+            except (TypeError, AttributeError):
+                # Keep paths visited before malformed data, as the report walk did.
+                break
+    return paths
+
+
+def enrich_maven_finding(issue, project, dependency_index, declaration_lookup=find_maven_declaration):
     coordinate = issue.get("maven_coordinate")
 
     if not coordinate:
@@ -342,21 +370,12 @@ def enrich_maven_finding(issue, project, report_dir, index=None, declarations=No
     if coordinate.count(":") == 2:
         coordinate = coordinate.rsplit(":", 1)[0]
 
-    if index is None:
-        index = build_maven_index(report_dir)
-    paths = [
-        [{"coordinate": component, "version": installed} for component, installed in chain]
-        for chain in index.get((coordinate, version), ())
-    ]
-
+    paths = dependency_index.get((coordinate, version))
     if not paths:
         return
 
     issue["dependency_chains"] = [
-        " -> ".join(
-            f'{node["coordinate"]}:{node["version"]}'
-            for node in chain
-        )
+        " -> ".join(f"{component}:{installed}" for component, installed in chain)
         for chain in paths
     ]
 
@@ -373,25 +392,20 @@ def enrich_maven_finding(issue, project, report_dir, index=None, declarations=No
     if len(paths) != 1:
         return
 
-    chain = paths[0]
+    chain = next(iter(paths))
 
     if len(chain) <= 2:
         return
 
-    parent = chain[-2]
-    direct = chain[1]
+    parent, parent_version = chain[-2]
+    direct, direct_version = chain[1]
 
-    issue["parent_dependency"] = parent["coordinate"]
-    issue["parent_version"] = parent["version"]
-    issue["direct_dependency"] = direct["coordinate"]
-    issue["direct_dependency_version"] = direct["version"]
+    issue["parent_dependency"] = parent
+    issue["parent_version"] = parent_version
+    issue["direct_dependency"] = direct
+    issue["direct_dependency_version"] = direct_version
 
-    if declarations is None:
-        declarations = {}
-    key = (direct["coordinate"], direct["version"])
-    if key not in declarations:
-        declarations[key] = find_maven_declaration(project, *key)
-    source, start, end = declarations[key]
+    source, start, end = declaration_lookup(project, direct, direct_version)
 
     if source and start and end:
         issue["direct_dependency_source_file"] = source
@@ -399,7 +413,7 @@ def enrich_maven_finding(issue, project, report_dir, index=None, declarations=No
         issue["direct_dependency_end_line"] = end
 
     issue["dependency_remediation"] = (
-        f'Review and update {direct["coordinate"]} '
+        f"Review and update {direct} "
         "to a compatible version that resolves the vulnerable "
         "transitive dependency. Verify the resolved version, "
         "rebuild, test and rerun the security scan."
@@ -604,8 +618,10 @@ def execute(options, system, arch):
         emit(f"{label}: {status} | {duration:.2f}s | {result}{suffix}")
 
     issue_ids = Counter()
-    maven_index = None
-    maven_declarations = {}
+    declaration_lookup = maven_declaration_lookup()
+    maven_index = {}
+    maven_reports = {}
+    maven_index_duration = None
     vulnerability_caches = {}
 
     def vulnerability_cache(scanner, location):
@@ -659,7 +675,6 @@ def execute(options, system, arch):
         log.flush()
 
         def execute_scan(name, action, skip=None):
-            nonlocal maven_index
             scan_started = time.monotonic()
             label = NAMES.get(name, "Syft")
             installation = installer.records[name]
@@ -703,16 +718,24 @@ def execute(options, system, arch):
             if name == "grype" and image_selected and scan_package_grype:
                 artifacts.insert(0, (work / "grype-sbom-report.json", "sbom"))
                 entry["additionalReports"] = []
+            entry["reportProcessing"] = []
             for native, target in artifacts:
+                processing = {"artifact": native.name}
+                entry["reportProcessing"].append(processing)
+                processing_started = time.perf_counter()
                 try:
-                    emit(f"{label}: loading JSON report...")
+                    emit(f"{label} | Loading {native.name}")
+                    stage_started = time.perf_counter()
                     with native.open(encoding="utf-8-sig") as source:
                         report = json.load(source)
+                    processing["loadSeconds"] = round(time.perf_counter() - stage_started, 3)
+                    emit(f"{label} | Sanitizing {native.name}")
+                    stage_started = time.perf_counter()
                     if name == "gitleaks":
                         redactor.add(capture_secrets(report))
                     output = report_dir / native.name
-                    emit(f"{label}: sanitizing JSON report...")
                     write_json(output, redactor.data(report, native=True))
+                    processing["sanitizeAndWriteSeconds"] = round(time.perf_counter() - stage_started, 3)
                     if native == raw_output:
                         entry["report"] = str(output)
                     else:
@@ -725,19 +748,21 @@ def execute(options, system, arch):
                         entry["inventoryCount"] = len(report.get("components", []))
 
                     else:
-                        kwargs = {"terminal": True} if name in {"dependency-check", "grype"} else {}
-                        emit(f"{label}: normalizing {native_count} findings...")
-                        if name in ("dependency-check", "grype") and maven_index is None:
-                            emit(f"{label}: indexing Maven dependency trees...")
-                            maven_index = build_maven_index(report_dir)
-                        last_update = time.monotonic()
-                        for number, item in enumerate(NORMALIZE[name](report, project, **kwargs), 1):
+                        maven_enrichment = name in {"dependency-check", "grype"}
+                        kwargs = {"terminal": True, "declaration_lookup": declaration_lookup} if maven_enrichment else {}
+                        emit(f"{label} | Normalizing {native_count} findings")
+                        if maven_enrichment:
+                            emit(f"{label} | Enriching Maven dependency evidence during normalization")
+                        stage_started = time.perf_counter()
+                        enrichment_seconds = 0
+                        next_update = stage_started + 5
+                        processed = 0
+                        for processed, item in enumerate(NORMALIZE[name](report, project, **kwargs), 1):
                             evidence = item.pop("_terminal", {})
-                            if name in ("dependency-check", "grype"):
-                                enrich_maven_finding(item, project, report_dir, maven_index, maven_declarations)
-                            if number % 100 == 0 or time.monotonic() - last_update >= 30:
-                                emit(f"{label}: processed {number}/{native_count} findings")
-                                last_update = time.monotonic()
+                            if maven_enrichment:
+                                enrichment_started = time.perf_counter()
+                                enrich_maven_finding(item, project, maven_index, declaration_lookup)
+                                enrichment_seconds += time.perf_counter() - enrichment_started
                             item = redactor.data(item)
                             item["issue_id"] = issue_identifier(item)
                             if name == "grype":
@@ -751,12 +776,24 @@ def execute(options, system, arch):
                             issues.append(item)
                             entry["findings"].append(item)
                             terminal_metadata.append(evidence)
+                            now = time.perf_counter()
+                            if processed % 1000 == 0 or now >= next_update:
+                                emit(f"{label} | Processed {processed}/{native_count} findings in {now - stage_started:.2f}s")
+                                next_update = now + 5
+                        elapsed = time.perf_counter() - stage_started
+                        processing["normalizeSeconds"] = round(elapsed - enrichment_seconds, 3)
+                        if maven_enrichment:
+                            processing["mavenEnrichmentSeconds"] = round(enrichment_seconds, 3)
+                        emit(f"{label} | Processed {processed}/{native_count} findings in {elapsed:.2f}s")
                     if reason := report_error(name, report):
                         problems.append(reason)
                 except FileNotFoundError:
                     problems.append(f"Scanner did not write {native.name}")
                 except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError) as error:
                     problems.append(f"Could not interpret {native.name}: {error}")
+                finally:
+                    processing["totalSeconds"] = round(time.perf_counter() - processing_started, 3)
+                    emit(f"{label} | Report processing took {processing['totalSeconds']:.3f}s")
             if entry["report"] or entry.get("additionalReports"):
                 entry["findingCount"] = len(entry["findings"])
                 if entry["nativeFindingCount"] != entry["findingCount"]:
@@ -783,30 +820,44 @@ def execute(options, system, arch):
             resolved_dependencies = False
 
             def prepare_dependencies():
-                nonlocal resolution_error, resolved_dependencies, maven_index
+                nonlocal resolution_error, resolved_dependencies, maven_index, maven_index_duration
                 if resolved_dependencies:
                     return
                 resolved_dependencies = True
-                maven_index = None
-                maven_declarations.clear()
                 try:
                     emit("Preparing Maven/Gradle dependencies...")
                     resolve_dependencies(project, builds, deps, log, diagnostics.append)
                     emit("Dependency resolution completed.")
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    resolution_error = str(error)
 
-                    for tree in sorted(deps.rglob("maven-dependency-tree.json")):
+                tree_paths = sorted(deps.rglob("maven-dependency-tree.json"))
+                if tree_paths:
+                    started = time.perf_counter()
+                    emit(f"Maven | Loading {len(tree_paths)} dependency tree report(s)")
+                    exported = {}
+                    for tree in tree_paths:
+                        parsed = maven_reports[tree] = MavenTreeReport(tree)
+                        if resolution_error is not None:
+                            continue
                         try:
-                            tree_data = list(maven_trees(tree))[-1]
-                            tree_report = report_dir / (
-                                "maven-dependency-tree-"
-                                + tree.parent.name + ".json"
-                            )
-                            write_json(tree_report, redactor.data(tree_data))
+                            if parsed.error:
+                                diagnostics.append(f"Maven dependency tree export failed ({parsed.error})")
+                                continue
+                            # Preserve the existing exported tree and enrichment scope.
+                            data = redactor.data(parsed.trees[-1])
+                            tree_report = report_dir / f"maven-dependency-tree-{tree.parent.name}.json"
+                            write_json(tree_report, data)
+                            exported[tree_report] = data
                             diagnostics.append("Maven dependency tree report generated")
                         except (OSError, ValueError, IndexError) as exc:
                             diagnostics.append(f"Maven dependency tree export failed ({type(exc).__name__})")
-                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                    resolution_error = str(error)
+                    emit(f"Maven | Prepared dependency tree reports in {time.perf_counter() - started:.3f}s")
+                    emit("Maven | Indexing dependency chains")
+                    started = time.perf_counter()
+                    maven_index = index_maven_dependencies(exported[path] for path in sorted(exported))
+                    maven_index_duration = round(time.perf_counter() - started, 3)
+                    emit(f"Maven | Indexed {len(maven_index)} dependency versions in {maven_index_duration:.3f}s")
 
             def dependency_check(cmd, out):
                 if not java:
@@ -948,7 +999,10 @@ def execute(options, system, arch):
             execute_scan("grype", grype, setup or applicability["grype"])
             execute_scan("checkov", checkov, setup or applicability["checkov"])
             if java_needed and resolved_dependencies:
-                contexts = dependency_contexts(project, builds, deps, diagnostics.append, files["maven"])
+                contexts = dependency_contexts(
+                    project, builds, deps, diagnostics.append, files["maven"],
+                    maven_reports=maven_reports, declaration_lookup=declaration_lookup,
+                )
 
         log.seek(0)
         with live_log.open("a", encoding="utf-8") as output:
@@ -969,6 +1023,7 @@ def execute(options, system, arch):
                "installations": installer.records,
                "scanners": statuses,
                "vulnerabilityCaches": vulnerability_caches,
+               "mavenIndexDurationSeconds": maven_index_duration,
                "toolVersions": {name: entry.get("version") for name, entry in installer.records.items()},
                "totalFindings": len(issues), "findingsBySeverity": dict(Counter(x["severity"] for x in issues)),
                "findingsByScanner": {name: len(entry["findings"]) for name, entry in statuses.items()},
@@ -991,7 +1046,7 @@ def execute(options, system, arch):
             pass
     counts, remediation_count, grouped = terminal_summary(
         issues, terminal_metadata, project, contexts, emit, details=options.details,
-        statuses=statuses, inventory=inventory,
+        statuses=statuses, inventory=inventory, declaration_lookup=declaration_lookup,
     )
     emit("\n=== Security Summary ===")
     emit(f"Scanner execution: {'failed' if failed else 'completed'} ({summary['totalDurationSeconds']:.2f}s)")

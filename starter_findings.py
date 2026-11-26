@@ -316,7 +316,8 @@ def semgrep_issues(report, project):
                         reference_links=references(meta.get("references"), meta.get("source")))
 
 
-def find_maven_declaration(project, component, version, *, declaration_pom=None, direct_only=False):
+def find_maven_declaration(project, component, version, *, declaration_pom=None,
+                           direct_only=False, find_poms=None):
     from pathlib import Path
     from xml.parsers import expat
 
@@ -327,7 +328,11 @@ def find_maven_declaration(project, component, version, *, declaration_pom=None,
     root = Path(project)
     matches = []
 
-    for pom in [declaration_pom] if declaration_pom else root.rglob("pom.xml"):
+    if declaration_pom:
+        poms = (declaration_pom,)
+    else:
+        poms = find_poms(root) if find_poms else root.rglob("pom.xml")
+    for pom in poms:
         if any(part in {".git", "target", ".venv", ".accidion"}
                for part in pom.relative_to(root).parts):
             continue
@@ -439,10 +444,10 @@ def find_maven_declaration(project, component, version, *, declaration_pom=None,
     return None, None, None
 
 
-def dependency_issues(report, project, *, terminal=False):
+def dependency_issues(report, project, *, terminal=False, declaration_lookup=find_maven_declaration):
     for item in report["dependencies"]:
         component, version = dependency_evidence(item)
-        pom_file, start_line, end_line = find_maven_declaration(
+        pom_file, start_line, end_line = declaration_lookup(
             project, component, version
         )
         for vuln in item.get("vulnerabilities") or []:
@@ -497,7 +502,7 @@ def dependency_issues(report, project, *, terminal=False):
             yield issue
 
 
-def grype_issues(report, _project, *, terminal=False):
+def grype_issues(report, _project, *, terminal=False, declaration_lookup=find_maven_declaration):
     for row in report["matches"]:
         vuln = row["vulnerability"]
         artifact = row.get("artifact") or {}
@@ -539,7 +544,7 @@ def grype_issues(report, _project, *, terminal=False):
         pom_file, start_line, end_line = None, None, None
 
         if artifact.get("type") == "java-archive" and group and artifact_id:
-            pom_file, start_line, end_line = find_maven_declaration(
+            pom_file, start_line, end_line = declaration_lookup(
                 _project, f"{group}:{artifact_id}", installed
             )
 
@@ -964,7 +969,7 @@ def source_remediation(issue):
     return (title, *infrastructure_guidance(issue, tech))
 
 
-def dependency_remediation(package, rows, project, contexts):
+def dependency_remediation(package, rows, project, contexts, declaration_lookup=find_maven_declaration):
     kind, component, version, variant = package[:4]
     if kind == "package":
         identity = component.rpartition("@")[0] or component
@@ -977,7 +982,7 @@ def dependency_remediation(package, rows, project, contexts):
     context = contexts.get((package[1], version), ()) if kind == "maven" and project_dependency else ()
     maven_source = any(technology(row["source_file"]) == "Maven" for row in rows)
     if not context and (kind == "maven" or maven_source) and project_dependency:
-        path, start, end = find_maven_declaration(project, package[1], version, direct_only=True)
+        path, start, end = declaration_lookup(project, package[1], version, direct_only=True)
         if path:
             context = [("Direct", package[1], version, source_label(path, start, end))]
 
@@ -1170,12 +1175,13 @@ def terminal_inventory(report, emit):
         terminal_field(emit, "Component examples", ", ".join(examples[:3]))
 
 
-def terminal_issue(number, scanner, package, findings, project, contexts, emit, details, metadata):
+def terminal_issue(number, scanner, package, findings, project, contexts, emit, details, metadata,
+                   declaration_lookup=find_maven_declaration):
     rows = [issue for evidence, _ in findings for issue in evidence]
     primary = rows[0]
     if package:
         component, locations, dependency_type, parents, version, steps, verification = (
-            dependency_remediation(package, rows, project, contexts)
+            dependency_remediation(package, rows, project, contexts, declaration_lookup)
         )
         title = dependency_title(component, rows, metadata)
         risks = dependency_risks(findings)
@@ -1239,7 +1245,8 @@ def terminal_issue(number, scanner, package, findings, project, contexts, emit, 
         terminal_evidence(findings, emit, metadata)
 
 
-def terminal_summary(issues, metadata, project, contexts, emit, *, details=False, statuses=None, inventory=None):
+def terminal_summary(issues, metadata, project, contexts, emit, *,
+                     details=False, statuses=None, inventory=None, declaration_lookup=find_maven_declaration):
     unique_groups, counts = terminal_groups(issues, metadata)
     evidence_by_issue = {id(issue): row for issue, row in zip(issues, metadata)}
     by_scanner = defaultdict(list)
@@ -1272,5 +1279,6 @@ def terminal_summary(issues, metadata, project, contexts, emit, *, details=False
         terminal_field(emit, "Grouped findings", grouped)
         terminal_field(emit, "Issues to review", len(groups))
         for number, (package, findings) in enumerate(groups, 1):
-            terminal_issue(number, label, package, findings, project, contexts, emit, details, evidence_by_issue)
+            terminal_issue(number, label, package, findings, project, contexts, emit, details, evidence_by_issue,
+                           declaration_lookup)
     return counts, len(unique_groups), grouped_total
