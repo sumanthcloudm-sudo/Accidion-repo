@@ -467,7 +467,7 @@ public class Main {
 
     def test_vulnerability_caches_persist_across_separate_runs(self):
         with tempfile.TemporaryDirectory() as root:
-            home = Path(root) / "data"
+            home = Path(root).resolve() / "data"
             project = Path(root) / "app"
             self.populate(project)
             cache_marker_seen = {"dependency-check": [], "grype": []}
@@ -507,7 +507,7 @@ public class Main {
     def test_large_maven_scan_shares_index_and_declaration_cache(self):
         with tempfile.TemporaryDirectory() as root:
             home = Path(root) / "data"
-            project = Path(root) / "app"
+            project = Path(root).resolve() / "app"
             self.populate(project)
             original = (project / "pom.xml").read_text()
             (project / "pom.xml").unlink()
@@ -765,7 +765,7 @@ public class Main {
 
     def test_dependency_paths_include_direct_and_multiple_transitive_parents(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             project = root / "app"
             project.mkdir()
             pom = project / "pom.xml"
@@ -1076,7 +1076,7 @@ class BootstrapTests(unittest.TestCase):
         self.mock_script(mock / "gh",
             '#!/usr/bin/env bash\nset -eu\n'
             'case "$1" in\n'
-            '  auth) [[ ${MOCK_GH_LOGIN:-0} == 1 ]]; printf "%s\\n" "$MOCK_TOKEN" ;;\n'
+            '  auth) [[ ${MOCK_GH_LOGIN:-0} == 1 ]] || exit 1; printf "%s\\n" "$MOCK_TOKEN" ;;\n'
             '  repo) [[ " $* " == *" $MOCK_REPO "* && $MOCK_HTTP_CODE == 404 ]]; echo true ;;\n'
             '  api) [[ " $* " == *"repos/$MOCK_REPO/contents/bootstrap.sh?ref=$MOCK_PIN " ]]; cat -- "$MOCK_BOOTSTRAP" ;;\n'
             '  release) [[ " $* " == *" kit-$MOCK_PIN "* && " $* " == *" $MOCK_REPO "* &&'
@@ -1085,7 +1085,7 @@ class BootstrapTests(unittest.TestCase):
         self.mock_script(mock / "git",
             '#!/usr/bin/env bash\nset -eu\n'
             'if [[ $1 == -C && $3 == credential && $4 == fill ]]; then\n'
-            '  [[ ${MOCK_CREDENTIAL_LOGIN:-0} == 1 && $GIT_TERMINAL_PROMPT == 0 && $GCM_INTERACTIVE == Never ]]\n'
+            '  [[ ${MOCK_CREDENTIAL_LOGIN:-0} == 1 && $GIT_TERMINAL_PROMPT == 0 && $GCM_INTERACTIVE == Never ]] || exit 1\n'
             '  [[ $GIT_CEILING_DIRECTORIES == "${2%/*}" && ! "$2" -ef "$MOCK_KIT" ]]\n'
             '  read -r protocol; read -r host; read -r path\n'
             '  [[ $protocol == protocol=https && $host == host=github.com && $path == path=*.git ]]\n'

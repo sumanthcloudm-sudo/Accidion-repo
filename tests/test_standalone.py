@@ -120,7 +120,7 @@ class StandaloneTests(unittest.TestCase):
                           "--report-dir", str(root / "other output"))
             self.assertEqual(plan.returncode, 0, plan.stderr)
             data = json.loads(plan.stdout)
-            self.assertEqual(Path(data["project"]), app)
+            self.assertEqual(Path(data["project"]), app.resolve())
             self.assertEqual(data["selectedScanners"], ["gitleaks"])
             self.assertFalse((root / "other output").exists())
             self.assertEqual(invoke("--dry-run", "--config=missing").returncode, 2)
@@ -219,7 +219,7 @@ class StandaloneTests(unittest.TestCase):
             statuses = json.loads(report.read_text(encoding="utf-8"))["scanners"]
             self.assertEqual(statuses["syft"]["status"], "unavailable")
             self.assertEqual(statuses["grype"]["status"], "success")
-            self.assertEqual(targets, [f"dir:{project}"])
+            self.assertEqual(targets, [f"dir:{project.resolve()}"])
             self.assertTrue(all(not path.exists() for path in scratch_paths))
 
     @unittest.skipUnless(os.name == "nt", "Uses Windows file sharing")

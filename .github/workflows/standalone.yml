@@ -113,7 +113,7 @@ jobs:
               print(f"Python and Gitleaks: {expected}")
           PY
       - name: Run the bare launcher twice with stock macOS Bash
-        if: runner.os == 'macOS'
+        if: (success() || failure()) && runner.os == 'macOS'
         env:
           ACCIDION_NVD_MIRROR: https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/nvdcve-{0}.json.gz
         run: |
@@ -159,6 +159,23 @@ jobs:
                   assert entry["installationStatus"] == expected, (scanner, entry)
                   json.loads(Path(entry["report"]).read_text(encoding="utf-8"))
                   print(f"{scanner}: {expected}, successful, valid JSON")
+          PY
+      - name: Report macOS installer and scanner failures
+        if: failure() && runner.os == 'macOS'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          for home in ("clean bootstrap home", "clean accidion home"):
+              for report in (Path(os.environ["RUNNER_TEMP"]) / home).rglob("security-summary.json"):
+                  summary = json.loads(report.read_text(encoding="utf-8"))
+                  print(home, report.parent.name)
+                  for section in ("installations", "scanners"):
+                      for name, entry in summary[section].items():
+                          if entry["status"] in {"failed", "unavailable", "installation_failed"}:
+                              print(section, name, entry["status"], entry["reason"])
           PY
       - name: Provision missing scanners and reuse them in a real scan
         if: runner.os != 'macOS'
