@@ -32,6 +32,23 @@ def host_bash():
 
 class StarterKitTests(unittest.TestCase):
     SECRET = "fixture-secret-only-947285"
+    def test_project_report_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "application"
+            project.mkdir()
+            private = root / "scan-test"
+            private.mkdir()
+            for name in kit.GENERATED_JSON:
+                (private / name).write_text("{}", encoding="utf-8")
+            (private / "run.log").write_text("private", encoding="utf-8")
+            exported = kit.export_project_reports(project, private)
+            self.assertEqual(exported, project / "reports" / private.name)
+            self.assertEqual({p.name for p in exported.iterdir()}, set(kit.GENERATED_JSON))
+            self.assertEqual((project / "reports" / ".gitignore").read_text().strip(), "*")
+            for name in kit.GENERATED_JSON:
+                self.assertEqual((exported / name).read_bytes(), (private / name).read_bytes())
+
     def test_platforms_and_assets(self):
         for system, machine, expected in [
             ("Windows", "AMD64", ("windows", "amd64")),
