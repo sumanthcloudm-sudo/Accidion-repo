@@ -180,6 +180,13 @@ the application directory.
 
 ## Security Reports
 
+After a scan, sanitized JSON reports are also exported automatically to
+`<application>/reports/<scan-directory>/` for viewing in IntelliJ IDEA.
+Each run uses a separate folder; private history and logs remain in the
+configured private report directory. Keep exported security findings private.
+No manual copying is required. Setup-only and dry-run do not export reports.
+
+
 Reports are generated in the configured output directory
 or the default location:
 
