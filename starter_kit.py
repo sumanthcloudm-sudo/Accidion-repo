@@ -134,6 +134,30 @@ def write_json(path, content):
     temporary.replace(path)
 
 
+def export_project_reports(project, report_dir):
+    """Publish sanitized reports in a separate, git-ignored per-run directory."""
+    destination = project / "reports"
+    if destination.is_symlink():
+        raise ValueError("Project reports directory must not be a symlink")
+    destination.mkdir(mode=0o700, exist_ok=True)
+    if destination.resolve().parent != project.resolve():
+        raise ValueError("Project reports directory must remain inside the project")
+    ignore = destination / ".gitignore"
+    if not ignore.exists():
+        with ignore.open("x", encoding="utf-8") as output:
+            output.write("*\n")
+    elif ignore.is_symlink() or "*" not in ignore.read_text(encoding="utf-8").splitlines():
+        raise ValueError("Project reports/.gitignore must contain a '*' rule")
+    exported = destination / report_dir.name
+    exported.mkdir(mode=0o700)
+    for filename in GENERATED_JSON:
+        source = report_dir / filename
+        if source.is_file():
+            with source.open("rb") as original, (exported / filename).open("xb") as output:
+                shutil.copyfileobj(original, output)
+    return exported
+
+
 def report_application_directory(name):
     label = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-_").lower()[:80].rstrip("-_")
     if re.fullmatch(r"con|prn|aux|nul|com[0-9]|lpt[0-9]", label):
@@ -1080,6 +1104,13 @@ def execute(options, system, arch):
     filenames = sorted(path.name for path in report_dir.glob("*.json"))
     emit("  JSON reports: " + ", ".join(filenames))
     emit("  Log: run.log")
+    if not options.setup_only:
+        try:
+            exported = export_project_reports(project, report_dir)
+            emit(f"Project JSON reports: {exported}")
+        except (OSError, ValueError) as error:
+            emit(f"Project report export failed: {error}. Private reports are retained.")
+            return 1
     return int(failed)
 
 
