@@ -1,5 +1,6 @@
 """Map scanner evidence to a common issue schema and scrub published output."""
 import hashlib
+import json
 import os
 import re
 from collections import Counter, defaultdict
@@ -219,6 +220,10 @@ GITLEAKS_GUIDANCE = {
 }
 
 
+def native_source_evidence(path, start, end):
+    return {"sourceLocation": (path if isinstance(path, str) and path else None, line(start), line(end))}
+
+
 def gitleaks_issues(report, project):
     for row in report or []:
         rule = row.get("RuleID")
@@ -231,7 +236,8 @@ def gitleaks_issues(report, project):
                         root_cause=guidance[1] if guidance else "Gitleaks matched a credential detection rule at this location.",
                         security_impact=guidance[2] if guidance else "If valid, the exposed credential may allow unauthorized access.",
                         recommended_remediation="Verify whether the value is active. Revoke or rotate it if valid, remove it from source, and retrieve it from an approved secret store.",
-                        rule_id=rule, reference_links=references(row.get("References")))
+                        rule_id=rule, reference_links=references(row.get("References")),
+                        _terminal=native_source_evidence(row.get("File"), row.get("StartLine"), row.get("EndLine")))
 
 
 SEMGREP_GUIDANCE = {
@@ -313,7 +319,9 @@ def semgrep_issues(report, project):
                         affected_dependency=first_text(meta.get("affected_dependency")),
                         installed_version=first_text(meta.get("installed_version")),
                         fixed_version=first_text(meta.get("fixed_version")),
-                        reference_links=references(meta.get("references"), meta.get("source")))
+                        reference_links=references(meta.get("references"), meta.get("source")),
+                        _terminal=native_source_evidence(row.get("path"), (row.get("start") or {}).get("line"),
+                                                         (row.get("end") or {}).get("line")))
 
 
 def find_maven_declaration(project, component, version, *, declaration_pom=None,
@@ -444,6 +452,21 @@ def find_maven_declaration(project, component, version, *, declaration_pom=None,
     return None, None, None
 
 
+def evidence_digest(value):
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def dependency_review_evidence(digests, vulnerability):
+    if not digests:
+        return None
+    material = {key: vulnerability.get(key) for key in (
+        "id", "name", "namespace", "severity", "cvss", "cvssv2", "cvssv3", "cvssv4",
+        "vulnerableSoftware", "fix", "dataSource",
+    )}
+    return evidence_digest([digests, material])
+
+
 def dependency_issues(report, project, *, terminal=False, declaration_lookup=find_maven_declaration):
     for item in report["dependencies"]:
         component, version = dependency_evidence(item)
@@ -498,6 +521,7 @@ def dependency_issues(report, project, *, terminal=False, declaration_lookup=fin
                 issue["_terminal"] = {
                     "package": next(iter(packages)) if len(packages) == 1 else None,
                     "aliases": advisory_ids(identifier),
+                    "reviewEvidence": dependency_review_evidence(item.get("sha1"), vuln),
                     "locations": list_of(item.get("filePath")),
                     "title": title,
                 }
@@ -588,6 +612,11 @@ def grype_issues(report, _project, *, terminal=False, declaration_lookup=find_ma
         if terminal:
             issue["_terminal"] = {
                 "package": first_text(artifact.get("purl")),
+                "reviewEvidence": dependency_review_evidence(sorted(
+                    (digest["algorithm"], digest["value"])
+                    for digest in (artifact.get("metadata") or {}).get("archiveDigests") or []
+                    if isinstance(digest, dict) and digest.get("algorithm") and digest.get("value")
+                ), vuln),
                 "locations": list(dict.fromkeys([
                     *package_paths, *(item["accessPath"] for item in artifact.get("locations") or []
                                       if first_text(item.get("accessPath")))
@@ -649,7 +678,11 @@ def checkov_issues(report, project):
                             or (f"Update the affected resource to meet this control: {row['check_name']}."
                                 if row.get("check_name") else
                                 "Update the affected infrastructure resource using the check guidance and rerun Checkov."),
-                            rule_id=rule, reference_links=references(row.get("guideline")))
+                            rule_id=rule, reference_links=references(row.get("guideline")),
+                            _terminal={**native_source_evidence(path or row.get("file_path"),
+                                                                lines[0] if lines else None,
+                                                                lines[-1] if len(lines) > 1 else None),
+                                       "resource": first_text(row.get("resource"))})
 
 
 NORMALIZE = {

@@ -11,16 +11,6 @@ PAYLOAD = (
 )
 
 
-# The tested standalone retained two earlier heredoc markers. Reuse them
-# only for the exact payloads they accompany in that release.
-TESTED_PAYLOAD_MARKERS = {
-    ("starter_kit.py", "380900bdff8f52d41235d3dd8991d85139b511c688326bf4fea2577adc828b6a"):
-        "76a9f3e7c7ed594b4037e9f51a89d8df9b53e44f775c7dfc69ab51b3769971ec",
-    ("starter_findings.py", "c78a2d121a56387e7e5d76705197eb8854f1d7d86615b78998160d831da9d6aa"):
-        "f84ead745374f4fa8f5979cf3c03ce3032bcad71ca080ca8284da0bc22a72687",
-}
-
-
 PREVIEW = r'''preview_payload() {
   "${python_cmd[@]}" -E -s -B -c '
 import sys
@@ -57,8 +47,7 @@ def build():
     for name in PAYLOAD:
         content = (ROOT / name).read_text(encoding="utf-8")
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        marker = TESTED_PAYLOAD_MARKERS.get((name, digest), digest)
-        delimiter = f"ACCIDION_{marker}"
+        delimiter = f"ACCIDION_{digest}"
         if delimiter in content.splitlines():
             raise ValueError(f"Payload delimiter collision in {name}")
         lines.extend((f"""  command cat > "$1/{name}" <<'{delimiter}'""",

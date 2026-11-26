@@ -22,6 +22,48 @@ class StandaloneTests(unittest.TestCase):
         subprocess.run([sys.executable, ROOT / "scripts/build_standalone.py", "--check"], check=True)
         self.assertNotIn(b"\r", (ROOT / "security-scan.sh").read_bytes())
 
+    def test_empty_arguments_after_automatic_properties_creation(self):
+        bash = "/bin/bash" if sys.platform == "darwin" else host_bash()
+        if not bash:
+            self.skipTest("Bash is required")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "empty arguments app"
+            tools = root / "test bin"
+            app.mkdir()
+            tools.mkdir()
+            launcher = app / "security-scan.sh"
+            shutil.copyfile(ROOT / launcher.name, launcher)
+            # Stop at the Python handoff so the bare command never installs scanners.
+            python = tools / "python3.12"
+            python.write_text(
+                '#!/bin/sh\n'
+                'if [ "$1" = "-c" ]; then exit 0; fi\n'
+                'printf "%s\\n" "$@"\n', encoding="ascii", newline="\n")
+            python.chmod(0o700)
+            env = {**os.environ, "ACCIDION_HOME": str(root / "private home"),
+                   "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}
+            env.pop("ACCIDION_REQUIRED_SCANNERS", None)
+
+            def scan():
+                return subprocess.run([bash, launcher.as_posix()], cwd=app, env=env,
+                                      capture_output=True, text=True, timeout=30)
+
+            first = scan()
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("unbound variable", first.stderr)
+            properties = app / "security-scan.properties"
+            self.assertEqual(properties.read_bytes(),
+                             b"# Security scan configuration\nPROJECT_ROOT=.\nOUTPUT_DIR=\n"
+                             b"SCANNERS=all\nDOCKER_IMAGE=\nBUILD_IMAGE=false\n")
+            self.assertIn("--scanner=all", first.stdout)
+            for config, expected in (("", "all"), ("SCANNERS=dependency-check\n", "dependency-check")):
+                properties.write_text(config, encoding="ascii")
+                result = scan()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"--scanner={expected}", result.stdout)
+                self.assertEqual(properties.read_text(), config)
+
     def test_central_launcher_refreshes_application_reports(self):
         bash, git = host_bash(), shutil.which("git")
         if not bash or not git:
@@ -49,7 +91,7 @@ class StandaloneTests(unittest.TestCase):
                 tool = fake / "gitleaks"
                 tool.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
                 tool.chmod(0o700)
-            env = {**os.environ, "ACCIDION_HOME": str(root.parent / f"{root.name}-cache"),
+            env = {**os.environ, "CI": "true", "ACCIDION_HOME": str(root.parent / f"{root.name}-cache"),
                    "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
             env.pop("ACCIDION_REQUIRED_SCANNERS", None)
             cache = Path(env["ACCIDION_HOME"])
@@ -57,6 +99,7 @@ class StandaloneTests(unittest.TestCase):
             reports = app / "reports"
             scanner_report = reports / "gitleaks-report.json"
             summary_report = reports / "security-summary.json"
+            dashboard = reports / kit.DASHBOARD
             properties = app / "security-scan.properties"
             default_properties = (
                 b"# Security scan configuration\nPROJECT_ROOT=.\nOUTPUT_DIR=\n"
@@ -75,6 +118,12 @@ class StandaloneTests(unittest.TestCase):
             self.assertFalse(reports.exists())
             first = scan()
             self.assertIn(str(reports.resolve()), first.stdout)
+            self.assertIn("Chrome: skipped (CI)", first.stdout)
+            self.assertEqual(first.stdout.count("Chrome:"), 1)
+            self.assertNotIn("Review group", first.stdout)
+            page = dashboard.read_text(encoding="utf-8")
+            self.assertIn("Previous Scanner", page)
+            self.assertIn("Next Scanner", page)
             self.assertEqual(json.loads(scanner_report.read_text()), [])
             summary = json.loads(summary_report.read_text())
             self.assertEqual(Path(summary["project"]), app.resolve())
@@ -82,7 +131,7 @@ class StandaloneTests(unittest.TestCase):
             self.assertEqual(Path(summary["scanners"]["gitleaks"]["report"]).read_bytes(),
                              scanner_report.read_bytes())
             subprocess.run([git, "-C", app, "check-ignore", "reports/gitleaks-report.json",
-                            "reports/security-summary.json"], check=True, capture_output=True)
+                            "reports/security-summary.json", f"reports/{kit.DASHBOARD}"], check=True, capture_output=True)
             exclude = root / ".git/info/exclude"
             rules = exclude.read_bytes()
 
@@ -126,7 +175,9 @@ class StandaloneTests(unittest.TestCase):
             self.assertEqual(json.loads(scanner_report.read_text()), [])
             self.assertEqual(json.loads(summary_report.read_text())["scanners"]["gitleaks"]["status"], "success")
 
-            scan(expected=1, FAIL_FIXTURE_SCANNER="1")
+            failed = scan(expected=1, FAIL_FIXTURE_SCANNER="1")
+            self.assertEqual(failed.stdout.count("Chrome:"), 1)
+            self.assertTrue(dashboard.is_file())
             self.assertFalse(scanner_report.exists())
             self.assertEqual(json.loads(summary_report.read_text())["scanners"]["gitleaks"]["status"], "failed")
 

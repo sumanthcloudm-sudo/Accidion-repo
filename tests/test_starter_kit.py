@@ -33,6 +33,148 @@ def host_bash():
 
 class StarterKitTests(unittest.TestCase):
     SECRET = "fixture-secret-only-947285"
+    def test_chrome_launch_offline_paths_and_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "application with spaces" / "reports" / "security-dashboard.html"
+            report.parent.mkdir(parents=True)
+            report.touch()
+            browser = root / "Chrome browser"
+            browser.touch()
+            with patch.dict(os.environ, {"CI": "true"}, clear=True), patch.object(kit.subprocess, "Popen") as spawn:
+                self.assertIn("CI", kit.open_dashboard_in_chrome(report, "linux"))
+                spawn.assert_not_called()
+            with patch.dict(os.environ, {}, clear=True), patch.object(kit.platform, "release", return_value="generic"):
+                self.assertIn("no desktop session", kit.open_dashboard_in_chrome(report, "linux"))
+            with patch.dict(os.environ, {"DISPLAY": ":0"}, clear=True), \
+                    patch.object(kit.platform, "release", return_value="generic"), \
+                    patch.object(kit.shutil, "which", return_value=None):
+                self.assertIn("not found", kit.open_dashboard_in_chrome(report, "linux"))
+            with patch.dict(os.environ, {"DISPLAY": ":0"}, clear=True), \
+                    patch.object(kit.platform, "release", return_value="generic"), \
+                    patch.object(kit.shutil, "which", return_value=str(browser)), \
+                    patch.object(kit.subprocess, "Popen") as spawn:
+                spawn.return_value.wait.side_effect = subprocess.TimeoutExpired("chrome", 0.15)
+                self.assertIn("open requested", kit.open_dashboard_in_chrome(report, "linux"))
+                self.assertEqual(spawn.call_args.args[0], [browser, report.as_uri()])
+                self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+                spawn.assert_called_once()
+                spawn.side_effect = OSError("fixture launch failure")
+                self.assertIn("could not open", kit.open_dashboard_in_chrome(report, "linux"))
+            for release, windows_path, url in (
+                ("4.4.0-Microsoft", r"C:\My project\reports\security-dashboard.html",
+                 "file:///C:/My%20project/reports/security-dashboard.html"),
+                ("5.15.167.4-microsoft-standard-WSL2",
+                 r"\\wsl.localhost\Ubuntu\My project\reports\security-dashboard.html",
+                 "file://wsl.localhost/Ubuntu/My%20project/reports/security-dashboard.html"),
+            ):
+                with self.subTest(release=release), patch.dict(os.environ, {}, clear=True), \
+                        patch.object(kit.platform, "release", return_value=release), \
+                        patch.object(kit, "wsl_chrome", return_value=browser), \
+                        patch.object(kit, "run", return_value=windows_path) as translate, \
+                        patch.object(kit.subprocess, "Popen") as spawn:
+                    spawn.return_value.wait.return_value = 0
+                    self.assertIn("open requested", kit.open_dashboard_in_chrome(report, "linux"))
+                    translate.assert_called_once_with(["wslpath", "-w", report], capture=True, timeout=3)
+                    self.assertEqual(spawn.call_args.args[0], [browser, url])
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(kit, "windows_desktop_available", return_value=True), \
+                    patch.object(kit, "windows_chrome", return_value=browser), \
+                    patch.object(kit.subprocess, "DETACHED_PROCESS", 8, create=True), \
+                    patch.object(kit.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, create=True), \
+                    patch.object(kit.subprocess, "Popen") as spawn:
+                spawn.return_value.wait.return_value = 0
+                self.assertIn("open requested", kit.open_dashboard_in_chrome(report, "windows"))
+                self.assertEqual(spawn.call_args.args[0], [browser, report.as_uri()])
+                self.assertEqual(spawn.call_args.kwargs["creationflags"], 520)
+            console = Path("/dev/console")
+            actual_stat = Path.stat
+
+            def stat(path, *args, **kwargs):
+                if path == console:
+                    return type("ConsoleStat", (), {"st_uid": 501})()
+                return actual_stat(path, *args, **kwargs)
+
+            with patch.dict(os.environ, {}, clear=True), patch.object(Path, "stat", stat), \
+                    patch.object(kit.os, "getuid", return_value=501, create=True), \
+                    patch.object(kit.subprocess, "run") as launch:
+                self.assertIn("open requested", kit.open_dashboard_in_chrome(report, "macos"))
+                launch.assert_called_once()
+                self.assertEqual(launch.call_args.args[0], ["/usr/bin/open", "-a", "Google Chrome", report.as_uri()])
+                launch.side_effect = subprocess.CalledProcessError(1, "/usr/bin/open")
+                self.assertIn("could not open", kit.open_dashboard_in_chrome(report, "macos"))
+
+    def test_project_report_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "application" / "reports"
+            destination.mkdir(parents=True)
+            private = root / "scan-test"
+            private.mkdir()
+            for name in kit.GENERATED_JSON:
+                (private / name).write_text(name, encoding="utf-8")
+            (private / "run.log").write_text("private", encoding="utf-8")
+            statuses = {
+                scanner: {"status": "success", "report": str(private / filename)}
+                for scanner, filename in kit.REPORTS.items()
+            }
+            statuses["grype"]["additionalReports"] = [str(private / "grype-sbom-report.json")]
+            kit.export_project_reports(destination, destination.stat(), private, statuses)
+            self.assertEqual({path.name for path in destination.iterdir()}, set(kit.GENERATED_JSON))
+            for name in kit.GENERATED_JSON:
+                self.assertEqual((destination / name).read_bytes(), (private / name).read_bytes())
+
+    def test_export_recovers_deleted_reports_with_existing_project_lock(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as lock:
+            root = Path(tmp).resolve()
+            project = root / "application"
+            project.mkdir()
+            home = root / "cache"
+            project_identity = project.stat()
+            destination, identity = kit.prepare_project_reports(project, home, lock)
+
+            contender = (
+                "import sys; from pathlib import Path; from contextlib import ExitStack; "
+                "from starter_kit import prepare_project_reports; "
+                "prepare_project_reports(Path(sys.argv[1]), Path(sys.argv[2]), ExitStack())"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", contender, project, home],
+                cwd=Path(kit.__file__).parent, capture_output=True, text=True, timeout=15,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not lock project reports", result.stderr)
+            # A separate process without the lock can still remove an empty output directory.
+            subprocess.run([sys.executable, "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).rmdir()",
+                            destination], check=True, timeout=15)
+            private = root / "private"
+            private.mkdir()
+            names = (*kit.REPORTS.values(), "security-summary.json", kit.DASHBOARD)
+            for name in names:
+                (private / name).write_text(name, encoding="utf-8")
+            statuses = {name: {"status": "success", "report": str(private / file)}
+                        for name, file in kit.REPORTS.items()}
+            kit.export_project_reports(destination, identity, private, statuses, project_identity=project_identity)
+            self.assertEqual({path.name for path in destination.iterdir()}, set(names))
+            for name in names:
+                self.assertEqual((destination / name).read_bytes(), (private / name).read_bytes())
+
+    def test_export_rejects_replacement_reports_or_application(self):
+        for changed in ("reports", "application"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as lock:
+                root = Path(tmp).resolve()
+                project = root / "application"
+                project.mkdir()
+                project_identity = project.stat()
+                destination, identity = kit.prepare_project_reports(project, root / "cache", lock)
+                original = project if changed == "application" else destination
+                original.rename(original.with_name("original"))
+                original.mkdir()
+                with self.assertRaisesRegex(ValueError, "changed during the scan"):
+                    kit.export_project_reports(destination, identity, root / "private", {},
+                                               project_identity=project_identity)
+                self.assertFalse((destination / "security-summary.json").exists())
+
     def test_platforms_and_assets(self):
         for system, machine, expected in [
             ("Windows", "AMD64", ("windows", "amd64")),
@@ -191,7 +333,7 @@ class StarterKitTests(unittest.TestCase):
                     self.assertNotIn("bootstrap attempted", result.stderr)
             preview = launch(*arguments, "--dry-run", "--no-install")
             self.assertEqual(preview.returncode, 0, preview.stderr)
-            self.assertIn("Python 3.10+ is missing", preview.stdout)
+            self.assertRegex(preview.stdout, r"Python 3\.10[^\n]* is missing")
             self.assertNotIn("bootstrap attempted", preview.stderr)
             setup = launch(*arguments, "--setup-only", "--no-install")
             self.assertEqual(setup.returncode, 2, setup.stderr)
@@ -271,7 +413,7 @@ class StarterKitTests(unittest.TestCase):
                  patch.object(installer, "bootstrap_pip") as bootstrap:
                 installer.install_pypi("semgrep")
             self.assertEqual(runner.call_args_list[2].args[0],
-                             [sys.executable, "-m", "venv", "--without-pip", base])
+                             [sys.executable, "-m", "venv", "--clear", "--without-pip", base])
             bootstrap.assert_called_once_with(base / "bin/python")
             self.assertEqual(installer.records["pip:semgrep"]["status"], "installed")
 
@@ -479,7 +621,8 @@ public class Main {
                             for key, title in findings.SCANNER_SECTIONS]
                 self.assertEqual(headings, sorted(headings))
                 self.assertGreater(output.index("=== Security Summary ===", headings[-1]), headings[-1])
-                self.assertRegex(output, r"JSON reports: .*security-summary\.json.*syft-sbom\.json")
+                self.assertIn("Application JSON reports:", output)
+                self.assertIn("Application security dashboard:", output)
                 self.assertNotIn("Related issue", output)
                 ends = headings[1:] + [output.index("=== Security Summary ===", headings[-1])]
                 sections = [output[start:end] for start, end in zip(headings, ends)]
@@ -615,7 +758,7 @@ public class Main {
                  patch.object(kit, "refresh_windows_path"), \
                  patch.object(kit, "private_run_path", side_effect=self.fake_private), \
                  contextlib.redirect_stdout(io.StringIO()) as terminal:
-                options = kit.args_for(["--project-path", str(project)])
+                options = kit.args_for(["--project-path", str(project), "--verbose"])
                 for run, finding_count in enumerate((1001, 1)):
                     # Move the declaration between runs to verify that cached line numbers expire.
                     if run:
@@ -781,8 +924,9 @@ public class Main {
             self.assertEqual(summary["scanners"]["checkov"]["status"], "skipped")
             self.assertEqual(summary["installations"]["checkov"]["status"], "skipped")
             self.assertRegex(terminal.getvalue(), r"Semgrep: failed \| \d+\.\d+s \| 1 finding")
-            self.assertIn("Security validation: incomplete coverage; findings require review", terminal.getvalue())
-            self.assertIn("SQL Injection", terminal.getvalue())
+            self.assertIn("Scanner execution: failed", terminal.getvalue())
+            self.assertIn("simulated network or permission failure", terminal.getvalue())
+            self.assertNotIn("SQL Injection", terminal.getvalue())
 
     def test_terminal_groups_aliases_without_merging_distinct_packages(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -828,8 +972,8 @@ public class Main {
             self.assertEqual(sum(len(evidence) for _, group in groups for evidence, _ in group), 7)
             self.assertEqual(groups[0][1][0][1], {cve, ghsa.upper()})
             output = []
-            severity, review = findings.terminal_summary(rows, metadata, project, {}, output.append)
-            self.assertEqual((sum(severity.values()), review["groups"], review["overlap"]), (6, 5, 1))
+            _, review = findings.terminal_summary(rows, metadata, project, {}, output.append)
+            self.assertEqual((review["groups"], review["dependency"]), (5, 6))
             rendered = "\n".join(output)
             self.assertRegex(rendered, r"Source file +pom\.xml")
             self.assertRegex(rendered, r"Line number\(s\) +3-5")
@@ -984,9 +1128,9 @@ public class Main {
                 metadata.append({"package": f"pkg:maven/example/lib-{number}@1",
                                  "aliases": [f"CVE-2025-1000{number}"]} if dependency else {})
         output = []
-        severity, review = findings.terminal_summary(
+        _, review = findings.terminal_summary(
             rows, metadata, Path.cwd(), {}, output.append, details=True)
-        self.assertEqual((sum(severity.values()), review["groups"], review["overlap"]), (8, 8, 2))
+        self.assertEqual((review["groups"], review["dependency"] + review["source"]), (8, 8))
         rendered = "\n".join(output)
         for key, title in findings.SCANNER_SECTIONS:
             if key == "syft":
@@ -1105,8 +1249,9 @@ public class Main {
                 self.assertEqual(kit.execute(kit.args_for(["--project-path", str(project)]), "linux", "amd64"), 0)
             rendered = terminal.getvalue()
             self.assertIn("Semgrep: skipped", rendered)
-            self.assertIn("Security validation: no findings reported by completed scans", rendered)
-            self.assertIn("CRITICAL 0 | HIGH 0 | MEDIUM 0 | LOW 0 | UNKNOWN 0", rendered)
+            self.assertIn("Scanner execution: completed", rendered)
+            self.assertRegex(rendered, r"Gitleaks: success \| \d+\.\d+s \| 0 findings")
+            self.assertNotIn("Review group", rendered)
             self.assertNotIn("Diagnostics", rendered)
 
 

@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import tarfile
 import tempfile
 import time
@@ -98,29 +99,46 @@ def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,),
                 raise RuntimeError("A Windows batch argument contains an unsafe shell character")
             quoted = " ".join(f'"{arg}"' for arg in args)
             args = f'"{os.environ["COMSPEC"]}" /d /v:off /s /c "{quoted}"'
-    with subprocess.Popen(
-        args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
-        stdout=subprocess.PIPE if capture else log, stderr=subprocess.STDOUT,
-        encoding="utf-8", errors="replace", start_new_session=os.name != "nt",
-    ) as process:
-        job = windows_process_job(process) if os.name == "nt" else None
-        try:
-            output, _ = process.communicate(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-            stop_process_tree(process, job)
-            process.communicate()
-            if isinstance(error, KeyboardInterrupt):
-                raise
-            raise CommandTimeout(f"Command exceeded the {timeout}-second timeout") from error
-        finally:
-            if job:
-                kernel, handle = job
-                kernel.CloseHandle(handle)
-        if process.returncode not in accepted:
-            if capture and log is not None:
-                print(output, file=log, flush=True)
-            raise RuntimeError(f"Command exited with status {process.returncode}")
-    return output or ""
+    finished = threading.Event()
+
+    def heartbeat():
+        started = time.monotonic()
+        while not finished.wait(30):
+            elapsed = int(time.monotonic() - started)
+            print(f"  Operation still running | Elapsed: {elapsed}s", file=sys.stderr, flush=True)
+
+    worker = None
+    if not capture and log is not None:
+        worker = threading.Thread(target=heartbeat, daemon=True)
+        worker.start()
+    try:
+        with subprocess.Popen(
+            args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
+            stdout=subprocess.PIPE if capture else log, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace", start_new_session=os.name != "nt",
+        ) as process:
+            job = windows_process_job(process) if os.name == "nt" else None
+            try:
+                output, _ = process.communicate(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+                stop_process_tree(process, job)
+                process.communicate()
+                if isinstance(error, KeyboardInterrupt):
+                    raise
+                raise CommandTimeout(f"Command exceeded the {timeout}-second timeout") from error
+            finally:
+                if job:
+                    kernel, handle = job
+                    kernel.CloseHandle(handle)
+            if process.returncode not in accepted:
+                if capture and log is not None:
+                    print(output, file=log, flush=True)
+                raise RuntimeError(f"Command exited with status {process.returncode}")
+        return output or ""
+    finally:
+        finished.set()
+        if worker is not None:
+            worker.join()
 
 
 def windows_process_job(process):
@@ -383,7 +401,6 @@ class Installer:
         return match[1]
 
     def ensure(self, name, wrapper=None, cwd=None):
-        import time
         from datetime import datetime, timezone
         ensure_started = time.perf_counter()
         ensure_started_at = datetime.now(timezone.utc).isoformat()
@@ -395,6 +412,8 @@ class Installer:
             java = Path(java_home) / ("bin/java.exe" if os.name == "nt" else "bin/java") if java_home else None
             candidates = [wrapper, [java] if java and java.is_file() else None,
                           [existing] if existing else None, self.managed(name)]
+            if name == "java" and self.system == "linux":
+                candidates.extend([str(p)] for p in sorted(Path("/usr/lib/jvm").glob("*/bin/java")) if p.is_file())
             if name == "semgrep" and self.system == "windows":
                 candidates = [candidate for cmd in filter(None, candidates)
                               for candidate in (cmd, [*cmd, "--legacy"])]
@@ -453,6 +472,10 @@ class Installer:
             version, _ = self.pypi_package(name)
             base = self.cache / f"{name}-{version}-{sys.version_info.major}.{sys.version_info.minor}"
             path = base / ("Scripts" if suffix else "bin") / (name + suffix)
+            if name == "checkov" and suffix and not path.is_file():
+                interpreter = base / "Scripts/python.exe"
+                if interpreter.is_file():
+                    return [str(interpreter), "-I", "-c", "from checkov.main import Checkov; raise SystemExit(Checkov().run())"]
             if name == "checkov" and not suffix:
                 interpreter = base / "bin/python"
                 if interpreter.is_file() and path.is_file():
@@ -504,22 +527,24 @@ class Installer:
     def install_pypi(self, name):
         version, package = self.pypi_package(name)
         base = self.cache / f"{name}-{version}-{sys.version_info.major}.{sys.version_info.minor}"
+        if base.is_symlink():
+            raise RuntimeError("Refusing to modify a symlinked scanner cache")
         python = base / ("Scripts/python.exe" if self.system == "windows" else "bin/python")
         try:
             pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
         except (OSError, RuntimeError):
             try:
-                run([sys.executable, "-m", "venv", base], log=self.log)
+                run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
             except RuntimeError:
                 if self.system != "linux":
                     raise
                 if linux_family() == "debian":
                     # Debian can ship the system interpreter without ensurepip.
-                    run([sys.executable, "-m", "venv", "--without-pip", base], log=self.log)
+                    run([sys.executable, "-m", "venv", "--clear", "--without-pip", base], log=self.log)
                     self.bootstrap_pip(python)
                 else:
                     run(package_command(self.system, "pip"), log=self.log)
-                    run([sys.executable, "-m", "venv", base], log=self.log)
+                    run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
             pip = run([python, "-m", "pip", "--version"], capture=True, log=self.log, timeout=60)
             status = "installed"
         else:
@@ -584,6 +609,11 @@ class Installer:
             extracted.mkdir()
             unpack(archive, extracted)
             (extracted / ".complete").touch()
+            # Recover interrupted archive installations only after verification.
+            if destination.is_symlink():
+                raise RuntimeError("Refusing to modify a symlinked scanner cache")
+            if destination.is_dir() and not (destination / ".complete").is_file():
+                shutil.rmtree(destination)
             try:
                 extracted.rename(destination)
             except OSError:
