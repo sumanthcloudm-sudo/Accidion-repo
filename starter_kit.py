@@ -304,7 +304,29 @@ def dependency_contexts(project, builds, deps, diagnostic, poms):
     return {key: sorted(values) for key, values in contexts.items()}
 
 
-def enrich_maven_finding(issue, project, report_dir):
+def build_maven_index(report_dir):
+    """Index dependency paths once per scan, preserving traversal order."""
+    index = defaultdict(list)
+    seen = defaultdict(set)
+
+    def walk(node, chain):
+        current = (f"{node.get('groupId')}:{node.get('artifactId')}", node.get("version"))
+        chain = chain + (current,)
+        if len(chain) > 1 and chain not in seen[current]:
+            seen[current].add(chain)
+            index[current].append(chain)
+        for child in node.get("children") or []:
+            walk(child, chain)
+
+    for tree in sorted(report_dir.glob("maven-dependency-tree-*.json")):
+        try:
+            walk(json.loads(tree.read_text(encoding="utf-8")), ())
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return index
+
+
+def enrich_maven_finding(issue, project, report_dir, index=None, declarations=None):
     coordinate = issue.get("maven_coordinate")
 
     if not coordinate:
@@ -320,34 +342,12 @@ def enrich_maven_finding(issue, project, report_dir):
     if coordinate.count(":") == 2:
         coordinate = coordinate.rsplit(":", 1)[0]
 
-    paths = []
-
-    def walk(node, chain):
-        group = node.get("groupId")
-        artifact = node.get("artifactId")
-        installed = node.get("version")
-
-        current = {
-            "coordinate": f"{group}:{artifact}",
-            "version": installed
-        }
-
-        chain = chain + [current]
-
-        if len(chain) > 1:
-            if current["coordinate"] == coordinate and installed == version:
-                if chain not in paths:
-                    paths.append(chain)
-
-        for child in node.get("children") or []:
-            walk(child, chain)
-
-    for tree in sorted(report_dir.glob("maven-dependency-tree-*.json")):
-        try:
-            data = json.loads(tree.read_text(encoding="utf-8"))
-            walk(data, [])
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
+    if index is None:
+        index = build_maven_index(report_dir)
+    paths = [
+        [{"coordinate": component, "version": installed} for component, installed in chain]
+        for chain in index.get((coordinate, version), ())
+    ]
 
     if not paths:
         return
@@ -386,9 +386,12 @@ def enrich_maven_finding(issue, project, report_dir):
     issue["direct_dependency"] = direct["coordinate"]
     issue["direct_dependency_version"] = direct["version"]
 
-    source, start, end = find_maven_declaration(
-        project, direct["coordinate"], direct["version"]
-    )
+    if declarations is None:
+        declarations = {}
+    key = (direct["coordinate"], direct["version"])
+    if key not in declarations:
+        declarations[key] = find_maven_declaration(project, *key)
+    source, start, end = declarations[key]
 
     if source and start and end:
         issue["direct_dependency_source_file"] = source
@@ -601,6 +604,8 @@ def execute(options, system, arch):
         emit(f"{label}: {status} | {duration:.2f}s | {result}{suffix}")
 
     issue_ids = Counter()
+    maven_index = None
+    maven_declarations = {}
     vulnerability_caches = {}
 
     def vulnerability_cache(scanner, location):
@@ -654,6 +659,7 @@ def execute(options, system, arch):
         log.flush()
 
         def execute_scan(name, action, skip=None):
+            nonlocal maven_index
             scan_started = time.monotonic()
             label = NAMES.get(name, "Syft")
             installation = installer.records[name]
@@ -699,11 +705,13 @@ def execute(options, system, arch):
                 entry["additionalReports"] = []
             for native, target in artifacts:
                 try:
+                    emit(f"{label}: loading JSON report...")
                     with native.open(encoding="utf-8-sig") as source:
                         report = json.load(source)
                     if name == "gitleaks":
                         redactor.add(capture_secrets(report))
                     output = report_dir / native.name
+                    emit(f"{label}: sanitizing JSON report...")
                     write_json(output, redactor.data(report, native=True))
                     if native == raw_output:
                         entry["report"] = str(output)
@@ -718,10 +726,18 @@ def execute(options, system, arch):
 
                     else:
                         kwargs = {"terminal": True} if name in {"dependency-check", "grype"} else {}
-                        for item in NORMALIZE[name](report, project, **kwargs):
+                        emit(f"{label}: normalizing {native_count} findings...")
+                        if name in ("dependency-check", "grype") and maven_index is None:
+                            emit(f"{label}: indexing Maven dependency trees...")
+                            maven_index = build_maven_index(report_dir)
+                        last_update = time.monotonic()
+                        for number, item in enumerate(NORMALIZE[name](report, project, **kwargs), 1):
                             evidence = item.pop("_terminal", {})
                             if name in ("dependency-check", "grype"):
-                                enrich_maven_finding(item, project, report_dir)
+                                enrich_maven_finding(item, project, report_dir, maven_index, maven_declarations)
+                            if number % 100 == 0 or time.monotonic() - last_update >= 30:
+                                emit(f"{label}: processed {number}/{native_count} findings")
+                                last_update = time.monotonic()
                             item = redactor.data(item)
                             item["issue_id"] = issue_identifier(item)
                             if name == "grype":
@@ -767,10 +783,12 @@ def execute(options, system, arch):
             resolved_dependencies = False
 
             def prepare_dependencies():
-                nonlocal resolution_error, resolved_dependencies
+                nonlocal resolution_error, resolved_dependencies, maven_index
                 if resolved_dependencies:
                     return
                 resolved_dependencies = True
+                maven_index = None
+                maven_declarations.clear()
                 try:
                     emit("Preparing Maven/Gradle dependencies...")
                     resolve_dependencies(project, builds, deps, log, diagnostics.append)
