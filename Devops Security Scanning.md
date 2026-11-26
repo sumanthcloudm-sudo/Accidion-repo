@@ -1,12 +1,12 @@
 # Accidion Developer Guide
 
-This guide is for a developer who has **already developed a Java application on their own laptop** and wants to scan that application for security findings using Accidion.
+This guide is for a developer who wants to scan an existing application for security findings. The examples use a Java application.
 
 Accidion is designed to run from **Windows (Git Bash), Linux (Bash), or macOS (Bash)**. Native end-to-end verification is not complete on every platform; tool availability and installation depend on the OS, architecture, permissions, and network access.
 
 ## 1. Purpose of the security scripts
 
-Accidion is a separate security toolkit. **Do not copy Accidion into your Java application or replace your application's code.**
+Copy the approved [standalone launcher](dist/security-scan.sh) into the application directory. The launcher extracts its embedded components to a temporary directory outside the application.
 
 When you run the launcher against your own application, Accidion:
 
@@ -14,7 +14,7 @@ When you run the launcher against your own application, Accidion:
 2. Discovers supported files inside that root, such as Java source, `pom.xml`, Gradle build files, JAR/WAR/EAR archives, Dockerfiles, and supported infrastructure files.
 3. Detects the operating system and CPU architecture.
 4. Verifies or, where supported and permitted, installs required tools; existing compatible tools and cached data may be reused.
-5. Runs the selected **applicable** scanners and records skipped or failed checks.
+5. Runs applicable scanners and records success, failure, skipped checks and unavailable tools.
 6. Creates private JSON reports, a consolidated findings summary, and a diagnostic log.
 
 **Accidion automatically discovers Java application components in the current working directory (or the configured application root) and executes the applicable security scanners.**
@@ -42,14 +42,14 @@ Detection does not mean automatic remediation. Developers review findings, updat
 
 ## 2. Security scanning launcher: security-scan.sh
 
-**Main launcher:** [security-scan.sh](security-scan.sh)
+**Main launcher:** [dist/security-scan.sh](dist/security-scan.sh)
 
-The actual `security-scan.sh` is included in the Accidion GitHub repository. You do **not** need to create another script or paste the launcher into your Java project. The launcher uses the other files shipped with the kit.
+Copy this file as `security-scan.sh`. It contains the supporting scripts and default scanner configuration.
 
 Basic usage, from **your Java application root**:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
+bash security-scan.sh
 ```
 
 That command runs the default selection of scanners (`all`). Accidion checks which scanners apply to your files; it can skip non-applicable checks.
@@ -57,19 +57,46 @@ That command runs the default selection of scanners (`all`). Accidion checks whi
 You can also specify the application explicitly from another directory:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --project-path "/path/to/my-java-app"
+bash security-scan.sh --project-path "/path/to/my-java-app"
 ```
+
+The first normal scan creates `security-scan.properties` in the selected
+application with defaults for the current directory, the private report
+location, all applicable scanners, and no container scan. Later scans reuse
+that file and preserve your edits. Help, preview and setup-only runs leave it
+alone.
+
+| Property | Meaning |
+| --- | --- |
+| `PROJECT_ROOT` | Application directory. Default `.` |
+| `OUTPUT_DIR` | Private report parent. An empty value uses the default |
+| `SCANNERS` | `all` or comma-separated scanner names |
+| `DOCKER_IMAGE` | Existing local Docker image |
+| `BUILD_IMAGE` | `true` to build and scan a discovered Dockerfile. Default `false` |
+
+Use `--config PATH` for an existing alternate file. Relative property paths
+start from the file's directory. CLI flags override property values. Use
+`bash security-scan.sh --config "../team scan.properties" --dry-run` to preview
+the effective scanner selection. Keep credentials in your approved secret
+store. Configure required scanners in the protected CI environment with
+`ACCIDION_REQUIRED_SCANNERS`.
+
+For scanner errors, consult the private `run.log` and the status in
+`security-summary.json`. On a cold Dependency-Check run, allow time to populate
+the NVD database. Use a permitted NVD API key or HTTPS mirror and reuse the cache.
+If Dependency-Check is waiting on a lock after an interrupted run, confirm the
+updater has stopped before using a fresh private cache.
 
 ### Scanner execution commands — choose one per run
 
-After cloning the kit (Section 3), enter your Java application root containing `pom.xml`. Accidion automatically discovers Maven and applicable application files. Choose one command below based on what you want to scan. These examples assume default properties unless overridden by the command. Run only the command you need today; there is no requirement to run every scanner each time. All commands use Bash/Git Bash on the developer's laptop, from the application root.
+After copying the standalone launcher, enter your Java application root containing `pom.xml`. Accidion automatically discovers Maven and applicable application files. Choose one command below based on what you want to scan. These examples assume default properties unless overridden by the command. Run only the command you need today; there is no requirement to run every scanner each time. All commands use Bash/Git Bash on the developer's laptop, from the application root.
 
 #### Complete security scan
 
 When: before integration or release. Where: application root. Reports: all applicable scanner reports, summary and log. Docker image scanning is opt-in.
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all
+bash security-scan.sh --scanner all
 ```
 
 #### Gitleaks — secret scanning
@@ -77,7 +104,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all
 When: before committing or after configuration changes. Where: application root. Report: `gitleaks-report.json`.
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks
+bash security-scan.sh --scanner gitleaks
 ```
 
 #### Semgrep — source-code security
@@ -85,7 +112,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks
 When: after source-code changes. Where: application root. Report: `semgrep-report.json`.
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner semgrep
+bash security-scan.sh --scanner semgrep
 ```
 
 #### OWASP Dependency-Check — Maven dependency security
@@ -93,7 +120,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner semgrep
 When: after changing Maven dependencies or when only dependency findings are needed. Where: Maven root containing `pom.xml`. Accidion detects Maven and attempts dependency resolution. Report: `dependency-check-report.json`; Maven dependency-tree JSON may also be produced.
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner dependency-check
+bash security-scan.sh --scanner dependency-check
 ```
 
 #### Syft — SBOM generation
@@ -101,7 +128,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner dependency-check
 When: a component inventory is needed. Where: application root. Report: `syft-sbom.json` (CycloneDX JSON, not a vulnerability list).
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner syft
+bash security-scan.sh --scanner syft
 ```
 
 #### Grype — package vulnerability scanning
@@ -109,7 +136,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner syft
 When: application package vulnerabilities need checking. Where: application root. Report: `grype-report.json`; Syft runs as a prerequisite when needed and may generate `syft-sbom.json`.
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype
+bash security-scan.sh --scanner grype
 ```
 
 #### Checkov — infrastructure security
@@ -117,7 +144,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype
 When: infrastructure or Dockerfile changes. Where: application root with supported files. Report: `checkov-report.json` if applicable.
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner checkov
+bash security-scan.sh --scanner checkov
 ```
 
 #### Multiple scanners
@@ -125,7 +152,7 @@ bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner checkov
 When: only a subset of checks is needed. Where: application root. Reports: the selected scanner outputs and any required prerequisite outputs.
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner gitleaks,semgrep
+bash security-scan.sh --scanner gitleaks,semgrep
 ```
 
 #### Docker image only
@@ -141,13 +168,13 @@ docker images
 Scan an existing image (replace the name and tag):
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --image my-app:latest
+bash security-scan.sh --scanner grype --image my-app:latest
 ```
 
 Build and scan using the application Dockerfile:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --build-image
+bash security-scan.sh --scanner grype --build-image
 ```
 
 #### Complete scan including Docker
@@ -157,18 +184,18 @@ Run from the application root to scan both the application and its image.
 Scan all applicable targets including an existing image:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all --image my-app:latest
+bash security-scan.sh --scanner all --image my-app:latest
 ```
 
 Build the image and run the complete scan:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner all --build-image
+bash security-scan.sh --scanner all --build-image
 ```
 
 Reports: applicable application reports and image findings, with `grype-sbom-report.json` when package findings are produced. Docker is optional for normal Java scans.
 
-For additional options, use `bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --help`.
+For additional options, use `bash security-scan.sh --help`.
 
 ## 3. Steps to run Accidion on your own Java application
 
@@ -193,23 +220,16 @@ Your application can use Maven or Gradle. Finish its normal build and tests befo
 - **Windows:** open **Git Bash**. Use a supported native Windows Python installation.
 - **Linux:** open **Bash**.
 - **macOS:** open **Bash**.
-- **All platforms:** Git, a writable home directory, and approved network access are needed for cloning and first-run downloads.
+- **All platforms:** Use a writable cache directory outside the application and approved network access for first-run downloads.
 - **Automatic tool setup:** Accidion automatically detects and attempts to install missing Python and security scanning tools on supported operating systems.
 - **Java builds/dependency checks:** use an appropriate JDK (Java 11 or newer for Dependency-Check), Maven/Gradle as applicable, and reachable approved dependency repositories.
 - **Docker:** optional, only for image scanning.
 
 Accidion may provision some missing prerequisites/tools on supported systems, but it does not bypass administrator permissions, system security policy, or network restrictions. If an essential prerequisite cannot be provisioned, obtain an approved installation.
 
-### Step 3 — Clone the Accidion kit once
+### Step 3 — Copy the standalone launcher
 
-Run these commands in Git Bash or Bash:
-
-```bash
-mkdir -p "$HOME/devsecops"
-git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git "$HOME/devsecops/Accidion-repo"
-```
-
-This is a **one-time clone**. Keep it separate from your Java application. In a team environment, use the organization-approved version/revision of the kit.
+Copy the approved [dist/security-scan.sh](dist/security-scan.sh) to the application directory and keep the filename `security-scan.sh`.
 
 ### Step 4 — Enter your Java application's root directory
 
@@ -245,19 +265,19 @@ From your Java application root, choose **one** of the following commands.
 Complete scan (default properties):
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh"
+bash security-scan.sh
 ```
 
 Maven dependency scan only:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner dependency-check
+bash security-scan.sh --scanner dependency-check
 ```
 
 Existing Docker image only (replace the image name and tag):
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --scanner grype --image my-app:latest
+bash security-scan.sh --scanner grype --image my-app:latest
 ```
 
 For other individual scanners or combinations, use Section 2.
@@ -267,7 +287,7 @@ Accidion discovers the applicable project files, checks required tools, runs app
 If you first want to see what Accidion detects without running scans:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --dry-run
+bash security-scan.sh --dry-run
 ```
 
 The first full run may download tools, Java dependencies, or vulnerability databases. Missing prerequisites, unsupported scanner packages, build problems, and blocked downloads can cause scans to fail or be skipped. Read the reported statuses rather than assuming every tool ran.
@@ -276,18 +296,18 @@ The first full run may download tools, Java dependencies, or vulnerability datab
 
 Open the new `security-summary.json`, review the scanner statuses and findings, then open the reported files in your own Java application. Fix confirmed vulnerabilities, rebuild, rerun tests, and repeat the **same** security-scan command.
 
-**Next time:** do **not** clone the kit again. Open a terminal, enter your application's root, and repeat Step 5.
+**Next time:** open a terminal, enter your application root, and repeat Step 5.
 
-## 4. Optional properties file: application root and output path
+## 4. Application properties and report paths
 
-**Configuration file:** [security-scan.properties](security-scan.properties), inside the **Accidion kit directory**.
+**Configuration file:** `security-scan.properties`, created in the application directory on the first normal scan.
 
-The file is optional. If left blank, the launcher scans the **current working directory** and writes reports under a private default directory. You do not need to change the properties file for normal use.
+The default scans the selected application and writes reports to the private default directory. Change the file to set recurring values.
 
-Default properties shipped with the kit:
+Defaults generated by the standalone launcher:
 
 ```properties
-PROJECT_ROOT=
+PROJECT_ROOT=.
 OUTPUT_DIR=
 SCANNERS=all
 DOCKER_IMAGE=
@@ -319,10 +339,10 @@ To configure Maven-only scanning as a recurring default, use `SCANNERS=dependenc
 Alternatively, keep properties at their defaults and pass values directly:
 
 ```bash
-bash "$HOME/devsecops/Accidion-repo/security-scan.sh" --project-path "/path/to/my-java-app" --report-dir "/path/to/private-reports"
+bash security-scan.sh --project-path "/path/to/my-java-app" --report-dir "/path/to/private-reports"
 ```
 
-Explicit command-line options take precedence over corresponding properties. The kit's properties file is read when the launcher starts; it is not a file you put inside every developer application.
+The launcher reads properties at startup and applies explicit command-line overrides. Use `--config PATH` to read an existing alternative. Keep reports outside the application.
 
 ## 5. Security reports: where to find them and how to read them
 
@@ -379,4 +399,4 @@ Do not publish reports containing sensitive project information or credentials. 
 
 ---
 
-**Developer workflow in one sentence:** Build and test your own Java application → clone Accidion once → enter that application's root → run `security-scan.sh` → review private JSON findings → fix your application → rescan.
+**Developer workflow in one sentence:** Build and test your own Java application → copy the standalone launcher → enter that application's root → run `security-scan.sh` → review private JSON findings → fix your application → rescan.

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -132,7 +133,7 @@ class StarterKitTests(unittest.TestCase):
             def launch(*arguments):
                 # Hide Python and make any package manager call observable.
                 return subprocess.run(
-                    [bash, "-c", 'cd -- "$1" || exit; shift; export PATH=./missing-bin ACCIDION_HOME=./home; '
+                    [bash, "-c", 'cd -- "$1" || exit; shift; export PATH=./missing-bin ACCIDION_HOME=./home UV_PYTHON_INSTALL_DIR=./unused-python; '
                      'uname() { case "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; esac; }; '
                      'dirname() { printf "%s\\n" "${2%/*}"; }; '
                      'brew() { echo "bootstrap attempted" >&2; return 1; }; '
@@ -226,6 +227,22 @@ class StarterKitTests(unittest.TestCase):
              patch.object(installer, "install", side_effect=PermissionError("blocked")):
             self.assertIsNone(installer.ensure("gitleaks"))
             self.assertEqual(installer.records["gitleaks"]["status"], "installation_failed")
+
+    def test_debian_recovers_partially_created_scanner_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            installer = starter_install.Installer("linux", "amd64", cache, True, None)
+            base = cache / f"semgrep-{starter_install.PYPI['semgrep']}-{sys.version_info.major}.{sys.version_info.minor}"
+            base.mkdir()
+            with patch.object(starter_install, "linux_family", return_value="debian"), \
+                 patch.object(starter_install, "run", side_effect=[RuntimeError("pip missing"),
+                              RuntimeError("ensurepip missing"), "", "pip 25.3", ""]) as runner, \
+                 patch.object(installer, "bootstrap_pip") as bootstrap:
+                installer.install_pypi("semgrep")
+            self.assertEqual(runner.call_args_list[2].args[0],
+                             [sys.executable, "-m", "venv", "--without-pip", base])
+            bootstrap.assert_called_once_with(base / "bin/python")
+            self.assertEqual(installer.records["pip:semgrep"]["status"], "installed")
 
     @staticmethod
     def populate(project):
@@ -486,6 +503,148 @@ public class Main {
                 summary = json.loads((run_directory / "security-summary.json").read_text())
                 self.assertEqual({key: info["presentBeforeScan"] for key, info in summary["vulnerabilityCaches"].items()},
                                  {"dependency-check": bool(index), "grype": bool(index)})
+
+    def test_large_maven_scan_shares_index_and_declaration_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "data"
+            project = Path(root) / "app"
+            self.populate(project)
+            original = (project / "pom.xml").read_text()
+            (project / "pom.xml").unlink()
+            (project / "module/pom.xml").unlink()
+            for number in range(24):
+                module = project / f"module-{number:02}"
+                module.mkdir()
+                (module / "pom.xml").write_text(
+                    f"<project><groupId>test</groupId><artifactId>module-{number}</artifactId></project>"
+                )
+            pom = project / "module-00" / "pom.xml"
+            declaration = (
+                "<dependency><groupId>test</groupId><artifactId>parent</artifactId>"
+                "<version>1.0</version></dependency>"
+            )
+            pom.write_text(original.replace("example</groupId><artifactId>fixture-app", "test</groupId><artifactId>module-0")
+                           .replace("<dependencies>", "<dependencies>\n    " + declaration))
+            parent_line = next(number for number, line in enumerate(pom.read_text().splitlines(), 1)
+                               if declaration in line)
+
+            def node(artifact, version="1.0", children=()):
+                return dict(groupId="test", artifactId=artifact, version=version, children=list(children))
+
+            def resolve(_project, builds, deps, _log, _diagnostic, *, timeout=3600):
+                for number, (family, _, _) in enumerate(builds):
+                    if family != "maven":
+                        continue
+                    target = deps / str(number)
+                    target.mkdir(exist_ok=True)
+                    previous = node(f"prior-{number}")
+                    padding = [node(f"library-{number}-{index}") for index in range(200)]
+                    children = [*padding]
+                    if number == 0:
+                        bridge = node("bridge", f"1.{run}", children=[node("test")])
+                        children.append(node("parent", children=[bridge]))
+                    tree = node(f"module-{number}", children=children)
+                    (target / "maven-dependency-tree.json").write_text(json.dumps(previous) + json.dumps(tree))
+
+            def ensure(installer, name, **kwargs):
+                installer.records[name] = {"status": "reused", "version": "123.4"}
+                return [name]
+
+            def scanner(args, **kwargs):
+                if args[0] == "dependency-check":
+                    out = Path(args[args.index("--out") + 1]) / kit.REPORTS["dependency-check"]
+                    package = {"id": "pkg:maven/test/test@1.0"}
+                    vulnerability = {"name": "CVE-2025-12345", "severity": "HIGH"}
+                    kit.write_json(out, {"dependencies": [
+                        {"fileName": "test.jar", "packages": [package], "vulnerabilities": [vulnerability]}
+                    ] * finding_count})
+                elif args[0] == "grype":
+                    out = Path(args[args.index("--file") + 1])
+                    artifact = {"name": "test", "version": "1.0", "type": "java-archive",
+                                "metadata": {"pomGroupID": "test", "pomArtifactID": "test"}}
+                    kit.write_json(out, {"matches": [
+                        {"vulnerability": {"id": "CVE-2025-12345", "severity": "High"}, "artifact": artifact}
+                    ] * finding_count})
+                else:
+                    return self.mock_run(args, **kwargs)
+
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(home), "GRYPE_DB_CACHE_DIR": ""}), \
+                 patch.object(kit.Installer, "ensure", ensure), \
+                 patch.object(kit, "run", side_effect=scanner), \
+                 patch.object(kit, "resolve_dependencies", side_effect=resolve), \
+                 patch.object(kit, "maven_trees", wraps=kit.maven_trees) as load_trees, \
+                 patch.object(kit, "index_maven_dependencies", wraps=kit.index_maven_dependencies) as index_trees, \
+                 patch.object(kit, "find_maven_declaration", wraps=kit.find_maven_declaration) as declare, \
+                 patch.object(kit, "refresh_windows_path"), \
+                 patch.object(kit, "private_run_path", side_effect=self.fake_private), \
+                 contextlib.redirect_stdout(io.StringIO()) as terminal:
+                options = kit.args_for(["--project-path", str(project)])
+                for run, finding_count in enumerate((1001, 1)):
+                    # Move the declaration between runs to verify that cached line numbers expire.
+                    if run:
+                        pom.write_text("\n" + pom.read_text())
+                    self.assertEqual(kit.execute(options, "linux", "amd64"), 0)
+                    summary_path = home / "reports" / "app" / str(run) / "security-summary.json"
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    self.assertEqual(set(summary["scanners"]), set(kit.REPORTS))
+                    self.assertTrue(all(row["status"] == "success" for row in summary["scanners"].values()))
+                    self.assertIsNotNone(summary["mavenIndexDurationSeconds"])
+                    for name in ("dependency-check", "grype"):
+                        result = summary["scanners"][name]
+                        self.assertEqual(result["status"], "success")
+                        self.assertEqual(result["nativeFindingCount"], finding_count)
+                        self.assertEqual(result["findingCount"], finding_count)
+                        timing = result["reportProcessing"][0]
+                        for stage in ("loadSeconds", "sanitizeAndWriteSeconds", "normalizeSeconds",
+                                      "mavenEnrichmentSeconds", "totalSeconds"):
+                            self.assertGreaterEqual(timing[stage], 0)
+                        for issue in result["findings"]:
+                            self.assertEqual(issue["dependency_chains"], [
+                                f"test:module-0:1.0 -> test:parent:1.0 -> test:bridge:1.{run} -> test:test:1.0"
+                            ])
+                            self.assertEqual(issue["dependency_type"], "Transitive")
+                            self.assertEqual(issue["parent_dependency"], "test:bridge")
+                            self.assertEqual(issue["direct_dependency"], "test:parent")
+                            self.assertEqual(issue["direct_dependency_source_file"], "module-00/pom.xml")
+                            self.assertEqual(issue["direct_dependency_start_line"], parent_line + run)
+                            self.assertEqual(issue["direct_dependency_end_line"], parent_line + run)
+                            self.assertIn("Review and update test:parent", issue["dependency_remediation"])
+                    self.assertEqual(load_trees.call_count, 24 * (run + 1))
+                    self.assertEqual(index_trees.call_count, run + 1)
+                    for component in ("test:test", "test:parent"):
+                        # Global lookups include both a miss for the vulnerable transitive
+                        # dependency and a hit for its direct ancestor.
+                        self.assertEqual(sum(call.args == (project, component, "1.0")
+                                             and "declaration_pom" not in call.kwargs
+                                             for call in declare.call_args_list), run + 1)
+            rendered = terminal.getvalue()
+            scanner_stages = [rendered.index(f"OWASP Dependency-Check | {message}") for message in (
+                "Loading dependency-check-report.json", "Sanitizing dependency-check-report.json",
+                "Normalizing 1001 findings", "Enriching Maven dependency evidence", "Processed 1000/1001 findings",
+            )]
+            self.assertEqual(scanner_stages, sorted(scanner_stages))
+            self.assertIn("Grype | Processed 1000/1001 findings", rendered)
+            self.assertLess(rendered.index("OWASP Dependency-Check: success"), rendered.index("Syft: running"))
+
+    def test_maven_index_preserves_order_classification_and_versions(self):
+        leaf = {"groupId": "test", "artifactId": "leaf", "version": "1"}
+        parent = {"groupId": "test", "artifactId": "parent", "version": "2", "children": [leaf]}
+        root = {"groupId": "test", "artifactId": "first", "version": "1", "children": [leaf, parent, parent]}
+        other = dict(root, artifactId="second", children=[parent, dict(leaf, version="2")])
+        index = kit.index_maven_dependencies([root, other, root])
+        issue = {"maven_coordinate": "test:leaf:1", "installed_version": "1"}
+        kit.enrich_maven_finding(issue, Path.cwd(), index)
+        self.assertEqual(issue["dependency_type"], "Direct and Transitive")
+        self.assertEqual(issue["dependency_chains"], [
+            "test:first:1 -> test:leaf:1",
+            "test:first:1 -> test:parent:2 -> test:leaf:1",
+            "test:second:1 -> test:parent:2 -> test:leaf:1",
+        ])
+        self.assertNotIn("direct_dependency", issue)
+        other_version = {"affected_dependency": "test:leaf", "installed_version": "2"}
+        kit.enrich_maven_finding(other_version, Path.cwd(), index)
+        self.assertEqual(other_version["dependency_type"], "Direct")
+        self.assertEqual(other_version["dependency_chains"], ["test:second:1 -> test:leaf:2"])
 
     def test_application_report_directory_is_safe(self):
         self.assertEqual(kit.report_application_directory("..\\CON"), "app-con")

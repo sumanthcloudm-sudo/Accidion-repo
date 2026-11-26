@@ -2,6 +2,7 @@
 import argparse
 import csv
 from collections import Counter, defaultdict
+import functools
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
 from starter_install import Installer, detect, refresh_windows_path, run
@@ -31,6 +33,13 @@ REPORTS = {
 GENERATED_JSON = (*REPORTS.values(), "grype-sbom-report.json", "security-summary.json")
 IGNORED = {".git", ".gradle", ".venv", "venv", "node_modules", ".terraform",
            ".cache", "__pycache__", ".pytest_cache", "reports"}
+MANIFESTS = {
+    "package.json": "javascript", "package-lock.json": "javascript", "yarn.lock": "javascript",
+    "pnpm-lock.yaml": "javascript", "tsconfig.json": "typescript",
+    "pyproject.toml": "python", "pipfile.lock": "python", "poetry.lock": "python", "uv.lock": "python",
+    "go.mod": "go", "go.sum": "go", "packages.lock.json": "dotnet", "packages.config": "dotnet",
+    "cargo.toml": "rust", "cargo.lock": "rust", "gemfile.lock": "ruby", "composer.lock": "php",
+}
 INFRA = (".tf", ".tf.json", ".bicep")
 IAC_MARKERS = re.compile(r'(?m)^\s*(?:apiVersion|AWSTemplateFormatVersion|Resources)\s*:|'
                          r'"(?:apiVersion|AWSTemplateFormatVersion|Resources|[$]schema)"\s*:')
@@ -46,7 +55,8 @@ def infrastructure_file(path):
 
 
 def discover(project):
-    files = {kind: [] for kind in ("java", "maven", "gradle", "jars", "dockerfiles", "iac", "opentofu")}
+    files = {kind: [] for kind in ("java", "maven", "gradle", "jars", "dockerfiles", "iac", "opentofu", "sql",
+                                     *sorted(set(MANIFESTS.values())))}
 
     def raise_walk_error(error):
         raise error
@@ -57,7 +67,7 @@ def discover(project):
         generated = bool(set(base.relative_to(project).parts) & {"build", "target"})
         for name in sorted(names):
             path = base / name
-            if path.is_symlink() or not path.is_file():
+            if name in GENERATED_JSON or path.is_symlink() or not path.is_file():
                 continue
             lower = name.lower()
             if lower.endswith((".jar", ".war", ".ear")):
@@ -65,6 +75,14 @@ def discover(project):
                     files["jars"].append(path)
             elif generated:
                 continue
+            elif lower in MANIFESTS:
+                files[MANIFESTS[lower]].append(path)
+            elif lower.startswith("requirements") and lower.endswith(".txt"):
+                files["python"].append(path)
+            elif lower.endswith((".csproj", ".fsproj", ".vbproj", ".deps.json")):
+                files["dotnet"].append(path)
+            elif lower.endswith(".sql"):
+                files["sql"].append(path)
             elif lower.endswith(".java"):
                 files["java"].append(path)
             elif name == "pom.xml":
@@ -192,7 +210,7 @@ def select_dockerfile(files, project):
     return dockerfiles[0] if len(dockerfiles) == 1 else None
 
 
-def resolve_dependencies(project, builds, out, log, diagnostic):
+def resolve_dependencies(project, builds, out, log, diagnostic, *, timeout=3600):
     for index, (family, root, tool) in enumerate(builds):
         if not tool:
             raise RuntimeError(f"No usable {family} build tool for {root.relative_to(project)}")
@@ -207,7 +225,7 @@ def resolve_dependencies(project, builds, out, log, diagnostic):
             args = [*tool, "--no-daemon", "--no-configuration-cache", "--console=plain", "--init-script",
                     KIT / "accidion-dependencies.gradle", f"-PaccidionDependencyDirectory={target}",
                     "accidionCollectDependencies"]
-        run(args, cwd=root, log=log)
+        run(args, cwd=root, log=log, timeout=timeout)
         if family == "maven":
             tree_file = target / "maven-dependency-tree.json"
 
@@ -222,7 +240,7 @@ def resolve_dependencies(project, builds, out, log, diagnostic):
             tree_args = [*args[:-1], "accidionDependencyPaths"]
 
         try:
-            run(tree_args, cwd=root, log=log)
+            run(tree_args, cwd=root, log=log, timeout=timeout)
         except Exception as error:
             diagnostic(f"{family} dependency paths unavailable ({type(error).__name__})")
 
@@ -247,7 +265,16 @@ def gradle_source_label(project, source, coordinate):
     return source_label(source, matches[0]) if len(matches) == 1 else source
 
 
-def dependency_contexts(project, builds, deps, diagnostic, poms):
+def maven_declaration_lookup():
+    @functools.cache
+    def find_poms(root):
+        return tuple(root.rglob("pom.xml"))
+
+    return functools.cache(functools.partial(find_maven_declaration, find_poms=find_poms))
+
+
+def dependency_contexts(project, builds, deps, diagnostic, poms, *,
+                        maven_reports=None, declaration_lookup=find_maven_declaration):
     modules = defaultdict(list)
     for pom in poms:
         try:
@@ -273,7 +300,11 @@ def dependency_contexts(project, builds, deps, diagnostic, poms):
                 continue
 
             tree = target / "maven-dependency-tree.json"
-            for data in maven_trees(tree):
+            trees = maven_trees(tree) if maven_reports is None else maven_reports.get(tree)
+            if trees is None:
+                diagnostic(f"{family} dependency path evidence unavailable (FileNotFoundError)")
+                continue
+            for data in trees:
                 candidates = [pom for pom in modules[data.get("groupId"), data.get("artifactId")]
                               if pom.is_relative_to(root)]
                 pom = candidates[0] if len(candidates) == 1 else root / "pom.xml"
@@ -282,7 +313,7 @@ def dependency_contexts(project, builds, deps, diagnostic, poms):
                     version = direct["version"]
                     key = pom, coordinate, version
                     if key not in declarations:
-                        _, start, end = find_maven_declaration(
+                        _, start, end = declaration_lookup(
                             pom.parent, coordinate, version, declaration_pom=pom)
                         declarations[key] = source_label(pom.relative_to(project).as_posix(), start, end)
                     nodes = [(direct, "Direct")]
@@ -291,12 +322,48 @@ def dependency_contexts(project, builds, deps, diagnostic, poms):
                         component = f"{node['groupId']}:{node['artifactId']}"
                         contexts[component, node["version"]].add((kind, coordinate, version, declarations[key]))
                         nodes.extend((child, "Transitive") for child in node.get("children") or [])
+            if maven_reports is not None and trees.error is not None:
+                diagnostic(f"{family} dependency path evidence unavailable ({trees.error})")
         except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
             diagnostic(f"{family} dependency path evidence unavailable ({type(error).__name__})")
     return {key: sorted(values) for key, values in contexts.items()}
 
 
-def enrich_maven_finding(issue, project, report_dir):
+class MavenTreeReport:
+    """Retain parsed trees for terminal evidence, including any prefix before an error."""
+
+    def __init__(self, path):
+        self.trees = []
+        self.error = None
+        try:
+            self.trees.extend(maven_trees(path))
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            self.error = type(error).__name__
+
+    def __iter__(self):
+        return iter(self.trees)
+
+
+def index_maven_dependencies(trees):
+    paths = defaultdict(dict)
+    for tree in trees:
+        pending = [(tree, ())]
+        while pending:
+            node, ancestors = pending.pop()
+            try:
+                coordinate = f"{node.get('groupId')}:{node.get('artifactId')}"
+                version = node.get("version")
+                chain = (*ancestors, (coordinate, version))
+                if ancestors:
+                    paths[coordinate, version][chain] = None
+                pending.extend((child, chain) for child in reversed(node.get("children") or []))
+            except (TypeError, AttributeError):
+                # Keep paths visited before malformed data, as the report walk did.
+                break
+    return paths
+
+
+def enrich_maven_finding(issue, project, dependency_index, declaration_lookup=find_maven_declaration):
     coordinate = issue.get("maven_coordinate")
 
     if not coordinate:
@@ -312,43 +379,12 @@ def enrich_maven_finding(issue, project, report_dir):
     if coordinate.count(":") == 2:
         coordinate = coordinate.rsplit(":", 1)[0]
 
-    paths = []
-
-    def walk(node, chain):
-        group = node.get("groupId")
-        artifact = node.get("artifactId")
-        installed = node.get("version")
-
-        current = {
-            "coordinate": f"{group}:{artifact}",
-            "version": installed
-        }
-
-        chain = chain + [current]
-
-        if len(chain) > 1:
-            if current["coordinate"] == coordinate and installed == version:
-                if chain not in paths:
-                    paths.append(chain)
-
-        for child in node.get("children") or []:
-            walk(child, chain)
-
-    for tree in sorted(report_dir.glob("maven-dependency-tree-*.json")):
-        try:
-            data = json.loads(tree.read_text(encoding="utf-8"))
-            walk(data, [])
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-
+    paths = dependency_index.get((coordinate, version))
     if not paths:
         return
 
     issue["dependency_chains"] = [
-        " -> ".join(
-            f'{node["coordinate"]}:{node["version"]}'
-            for node in chain
-        )
+        " -> ".join(f"{component}:{installed}" for component, installed in chain)
         for chain in paths
     ]
 
@@ -365,22 +401,20 @@ def enrich_maven_finding(issue, project, report_dir):
     if len(paths) != 1:
         return
 
-    chain = paths[0]
+    chain = next(iter(paths))
 
     if len(chain) <= 2:
         return
 
-    parent = chain[-2]
-    direct = chain[1]
+    parent, parent_version = chain[-2]
+    direct, direct_version = chain[1]
 
-    issue["parent_dependency"] = parent["coordinate"]
-    issue["parent_version"] = parent["version"]
-    issue["direct_dependency"] = direct["coordinate"]
-    issue["direct_dependency_version"] = direct["version"]
+    issue["parent_dependency"] = parent
+    issue["parent_version"] = parent_version
+    issue["direct_dependency"] = direct
+    issue["direct_dependency_version"] = direct_version
 
-    source, start, end = find_maven_declaration(
-        project, direct["coordinate"], direct["version"]
-    )
+    source, start, end = declaration_lookup(project, direct, direct_version)
 
     if source and start and end:
         issue["direct_dependency_source_file"] = source
@@ -388,7 +422,7 @@ def enrich_maven_finding(issue, project, report_dir):
         issue["direct_dependency_end_line"] = end
 
     issue["dependency_remediation"] = (
-        f'Review and update {direct["coordinate"]} '
+        f"Review and update {direct} "
         "to a compatible version that resolves the vulnerable "
         "transitive dependency. Verify the resolved version, "
         "rebuild, test and rerun the security scan."
@@ -463,9 +497,9 @@ def validate_report_directory(path, label):
             return
 
 
-def execute(options, system, arch):
+def execute(options, system, arch, *, in_memory_preview=False):
     os.umask(0o077)
-    for filename in TOOLKIT_FILES:
+    for filename in (() if in_memory_preview and options.dry_run else TOOLKIT_FILES):
         path = KIT / filename
         if not path.is_file() or not os.access(path, os.R_OK):
             raise ValueError(f"Required toolkit file is missing or unreadable: {path}. "
@@ -473,6 +507,16 @@ def execute(options, system, arch):
     project = options.project_path.resolve()
     if not project.is_dir():
         raise ValueError(f"Application path must be an accessible directory: {project}")
+    timeout = int(os.getenv("ACCIDION_SCAN_TIMEOUT", "3600"))
+    if timeout < 1:
+        raise ValueError("ACCIDION_SCAN_TIMEOUT must be a positive number of seconds")
+    nvd_mirror = os.getenv("ACCIDION_NVD_MIRROR")
+    if nvd_mirror:
+        mirror = urlsplit(nvd_mirror)
+        if (mirror.scheme != "https" or not mirror.hostname or mirror.username is not None
+                or mirror.query or mirror.fragment or "{0}" not in mirror.path
+                or any(character.isspace() for character in nvd_mirror)):
+            raise ValueError("ACCIDION_NVD_MIRROR requires an HTTPS NVD feed URL template with {0} and no credentials")
     files = discover(project)
     roots = {family: build_roots(files, family) for family in ("maven", "gradle")}
     app_name = application_name(project, roots)
@@ -484,17 +528,33 @@ def execute(options, system, arch):
     image_requested = bool(options.image or options.build_image)
     java_app = bool(files["java"] or files["jars"] or files["maven"] or files["gradle"])
     java_needed = bool(files["jars"] or files["maven"] or files["gradle"])
+    package_app = java_app or any(files[technology] for technology in MANIFESTS.values())
+    scan_exclusions = []
+    launcher = os.environ.get("ACCIDION_STANDALONE_LAUNCHER")
+    toolkit = [KIT / name for name in (*TOOLKIT_FILES, "security-scan.sh", "python-bootstrap.sh", "dist/security-scan.sh")]
+    if launcher:
+        toolkit.append(Path(launcher).resolve())
+    for path in toolkit:
+        if path.is_relative_to(project):
+            scan_exclusions.append(path.relative_to(project))
+
     applicability = {
         "gitleaks": None,
-        "semgrep": None if java_app else "No Java application inputs",
+        "semgrep": None if java_app or files["sql"] else "No inputs for bundled Java and SQL rules",
         "dependency-check": None if java_needed else "No Maven/Gradle build files or Java archives",
-        "syft": None if java_app else "No Java application inputs",
-        "grype": None if java_app or options.image or options.build_image else "No Java SBOM or container target",
+        "syft": None if package_app else "No supported package manifests or Java inputs",
+        "grype": None if package_app or image_requested else "No supported package manifests or container target",
         "checkov": None if files["iac"] or files["dockerfiles"] else (
             "OpenTofu files found, but native .tofu/.tofu.json coverage is unavailable"
             if files["opentofu"] else "No supported infrastructure candidates"),
     }
     selected = set(getattr(options, "scanner", REPORTS))
+    required = os.getenv("ACCIDION_REQUIRED_SCANNERS")
+    policy = set(scanner_selection(required)) if required else set()
+    if policy and (options.setup_only or options.dry_run):
+        raise ValueError("Configured policy requires a full scan execution")
+    if not policy.issubset(selected):
+        raise ValueError("Scanner selection omits scanners required by ACCIDION_REQUIRED_SCANNERS")
     prerequisites = set()
 
     if image_requested and "grype" not in selected:
@@ -504,7 +564,7 @@ def execute(options, system, arch):
 
     scan_package_grype = (
         "grype" in selected
-        and java_app
+        and package_app
         and (not image_requested or complete_scan)
     )
 
@@ -588,6 +648,10 @@ def execute(options, system, arch):
         suffix = f" | {reason}" if reason else ""
         emit(f"{label}: {status} | {duration:.2f}s | {result}{suffix}")
 
+    declaration_lookup = maven_declaration_lookup()
+    maven_index = {}
+    maven_reports = {}
+    maven_index_duration = None
     issue_ids = Counter()
     vulnerability_caches = {}
 
@@ -602,8 +666,20 @@ def execute(options, system, arch):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         return path
 
-    with tempfile.TemporaryFile(mode="w+", dir=report_dir, encoding="utf-8", errors="replace") as log:
+    with (
+        tempfile.TemporaryDirectory(prefix="scanner-state-", dir=report_dir) as scanner_state,
+        tempfile.TemporaryFile(mode="w+", dir=report_dir, encoding="utf-8", errors="replace") as log,
+    ):
         installer = Installer(system, arch, cache, not options.no_install, log)
+        installer.scratch_env = {key: scanner_state for key in ("TMPDIR", "TEMP", "TMP")}
+        # Semgrep's Windows RPC transport uses the native temp path. Keep it short
+        # while placing Python's scratch directory and Semgrep state with the report.
+        installer.semgrep_env = {
+            "TMPDIR": scanner_state,
+            "SEMGREP_LOG_FILE": str(Path(scanner_state) / "semgrep.log"),
+            "SEMGREP_SETTINGS_FILE": str(Path(scanner_state) / "settings.yml"),
+            "SEMGREP_ENABLE_VERSION_CHECK": "0",
+        }
         installer.records["python"] = {
             "status": "installed" if os.getenv("ACCIDION_PYTHON_BOOTSTRAPPED") else "reused",
             "version": ".".join(map(str, sys.version_info[:3])),
@@ -639,6 +715,9 @@ def execute(options, system, arch):
                 tools[name] = None
             else:
                 tools[name] = installer.ensure(name)
+        for name, record in installer.records.items():
+            if record["status"] in {"unavailable", "installation_failed"}:
+                print(f"{name}: {record['reason']}", file=log)
         log.flush()
 
         def execute_scan(name, action, skip=None):
@@ -668,8 +747,9 @@ def execute(options, system, arch):
                 progress(label, "skipped", unit=unit, reason=skip)
                 return
             if not tools[name]:
-                entry.update(status="failed", reason=installation.get("reason"))
-                progress(label, "failed", unit=unit, reason="Tool unavailable; review installation in the report")
+                entry.update(status="unavailable", reason=installation.get("reason"))
+                progress(label, "unavailable", unit=unit, reason=redactor.text(entry["reason"]) if entry["reason"]
+                         else "Tool unavailable; review installation in the report")
                 return
             raw_output = work / REPORTS[name]
             problems = []
@@ -685,14 +765,24 @@ def execute(options, system, arch):
             if name == "grype" and image_selected and scan_package_grype:
                 artifacts.insert(0, (work / "grype-sbom-report.json", "sbom"))
                 entry["additionalReports"] = []
+            entry["reportProcessing"] = []
             for native, target in artifacts:
+                processing = {"artifact": native.name}
+                entry["reportProcessing"].append(processing)
+                processing_started = time.perf_counter()
                 try:
+                    emit(f"{label} | Loading {native.name}")
+                    stage_started = time.perf_counter()
                     with native.open(encoding="utf-8-sig") as source:
                         report = json.load(source)
+                    processing["loadSeconds"] = round(time.perf_counter() - stage_started, 3)
+                    emit(f"{label} | Sanitizing {native.name}")
+                    stage_started = time.perf_counter()
                     if name == "gitleaks":
                         redactor.add(capture_secrets(report))
                     output = report_dir / native.name
                     write_json(output, redactor.data(report, native=True))
+                    processing["sanitizeAndWriteSeconds"] = round(time.perf_counter() - stage_started, 3)
                     if native == raw_output:
                         entry["report"] = str(output)
                     else:
@@ -705,11 +795,21 @@ def execute(options, system, arch):
                         entry["inventoryCount"] = len(report.get("components", []))
 
                     else:
-                        kwargs = {"terminal": True} if name in {"dependency-check", "grype"} else {}
-                        for item in NORMALIZE[name](report, project, **kwargs):
+                        maven_enrichment = name in {"dependency-check", "grype"}
+                        kwargs = {"terminal": True, "declaration_lookup": declaration_lookup} if maven_enrichment else {}
+                        emit(f"{label} | Normalizing {native_count} findings")
+                        if maven_enrichment:
+                            emit(f"{label} | Enriching Maven dependency evidence during normalization")
+                        stage_started = time.perf_counter()
+                        enrichment_seconds = 0
+                        next_update = stage_started + 5
+                        processed = 0
+                        for processed, item in enumerate(NORMALIZE[name](report, project, **kwargs), 1):
                             evidence = item.pop("_terminal", {})
-                            if name in ("dependency-check", "grype"):
-                                enrich_maven_finding(item, project, report_dir)
+                            if maven_enrichment:
+                                enrichment_started = time.perf_counter()
+                                enrich_maven_finding(item, project, maven_index, declaration_lookup)
+                                enrichment_seconds += time.perf_counter() - enrichment_started
                             item = redactor.data(item)
                             item["issue_id"] = issue_identifier(item)
                             if name == "grype":
@@ -723,58 +823,97 @@ def execute(options, system, arch):
                             issues.append(item)
                             entry["findings"].append(item)
                             terminal_metadata.append(evidence)
+                            now = time.perf_counter()
+                            if processed % 1000 == 0 or now >= next_update:
+                                emit(f"{label} | Processed {processed}/{native_count} findings in {now - stage_started:.2f}s")
+                                next_update = now + 5
+                        elapsed = time.perf_counter() - stage_started
+                        processing["normalizeSeconds"] = round(elapsed - enrichment_seconds, 3)
+                        if maven_enrichment:
+                            processing["mavenEnrichmentSeconds"] = round(enrichment_seconds, 3)
+                        emit(f"{label} | Processed {processed}/{native_count} findings in {elapsed:.2f}s")
                     if reason := report_error(name, report):
                         problems.append(reason)
                 except FileNotFoundError:
                     problems.append(f"Scanner did not write {native.name}")
                 except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError) as error:
                     problems.append(f"Could not interpret {native.name}: {error}")
+                finally:
+                    processing["totalSeconds"] = round(time.perf_counter() - processing_started, 3)
+                    emit(f"{label} | Report processing took {processing['totalSeconds']:.3f}s")
             if entry["report"] or entry.get("additionalReports"):
-                entry["findingCount"] = len(entry["findings"])
-                if entry["nativeFindingCount"] != entry["findingCount"]:
+                observed = len(entry["findings"])
+                entry["findingCount"] = observed if not problems or observed else None
+                if entry["nativeFindingCount"] is not None and entry["nativeFindingCount"] != observed:
                     problems.append(f"Native findings ({entry['nativeFindingCount']}) differ from normalized "
-                                    f"findings ({entry['findingCount']}); inspect the individual report")
+                                    f"findings ({observed}); inspect the individual report")
+            if problems and entry["nativeFindingCount"] == 0:
+                entry["nativeFindingCount"] = None
+                entry["findingCount"] = None
             entry.update(status="failed" if problems else "success",
                          reason=redactor.text("; ".join(problems)) if problems else None)
             entry["completedAt"] = datetime.now(timezone.utc).isoformat()
             entry["durationSeconds"] = round(time.perf_counter() - scanner_started, 2)
             count = entry.get("inventoryCount") if name == "syft" else entry["findingCount"]
             progress(label, entry["status"], entry["durationSeconds"], count, unit,
-                     "Review scanner report and run.log" if problems else None)
+                     redactor.text(problems[0]) if problems else None)
+            if problems:
+                print(f"{label}: {entry['reason']}", file=log)
             log.flush()
 
         def invoke(cmd, *args, accepted=(0,), env=None):
             print(f"\n--- {Path(cmd[0]).name} ---", file=log, flush=True)
-            run([*cmd, *args], cwd=project, log=log, accepted=accepted, env=env)
+            scanner_env = {**os.environ, **(env if env is not None else installer.scratch_env)}
+            run([*cmd, *args], cwd=project, log=log, accepted=accepted, env=scanner_env, timeout=timeout)
 
         with tempfile.TemporaryDirectory(prefix="work-", dir=report_dir) as directory:
             work = Path(directory)
             deps = work / "dependencies"
             deps.mkdir()
             resolution_error = None
+            dependency_resolution_seconds = None
             resolved_dependencies = False
 
             def prepare_dependencies():
-                nonlocal resolution_error, resolved_dependencies
+                nonlocal resolution_error, resolved_dependencies, maven_index, maven_index_duration, dependency_resolution_seconds
                 if resolved_dependencies:
                     return
                 resolved_dependencies = True
+                resolution_started = time.perf_counter()
                 try:
-                    resolve_dependencies(project, builds, deps, log, diagnostics.append)
+                    resolve_dependencies(project, builds, deps, log, diagnostics.append, timeout=timeout)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    resolution_error = str(error)
+                finally:
+                    dependency_resolution_seconds = round(time.perf_counter() - resolution_started, 3)
 
-                    for tree in sorted(deps.rglob("maven-dependency-tree.json")):
+                tree_paths = sorted(deps.rglob("maven-dependency-tree.json"))
+                if tree_paths:
+                    started = time.perf_counter()
+                    emit(f"Maven | Loading {len(tree_paths)} dependency tree report(s)")
+                    exported = {}
+                    for tree in tree_paths:
+                        parsed = maven_reports[tree] = MavenTreeReport(tree)
+                        if resolution_error is not None:
+                            continue
                         try:
-                            tree_data = list(maven_trees(tree))[-1]
-                            tree_report = report_dir / (
-                                "maven-dependency-tree-"
-                                + tree.parent.name + ".json"
-                            )
-                            write_json(tree_report, redactor.data(tree_data))
+                            if parsed.error:
+                                diagnostics.append(f"Maven dependency tree export failed ({parsed.error})")
+                                continue
+                            # Preserve the existing exported tree and enrichment scope.
+                            data = redactor.data(parsed.trees[-1])
+                            tree_report = report_dir / f"maven-dependency-tree-{tree.parent.name}.json"
+                            write_json(tree_report, data)
+                            exported[tree_report] = data
                             diagnostics.append("Maven dependency tree report generated")
                         except (OSError, ValueError, IndexError) as exc:
                             diagnostics.append(f"Maven dependency tree export failed ({type(exc).__name__})")
-                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                    resolution_error = str(error)
+                    emit(f"Maven | Prepared dependency tree reports in {time.perf_counter() - started:.3f}s")
+                    emit("Maven | Indexing dependency chains")
+                    started = time.perf_counter()
+                    maven_index = index_maven_dependencies(exported[path] for path in sorted(exported))
+                    maven_index_duration = round(time.perf_counter() - started, 3)
+                    emit(f"Maven | Indexed {len(maven_index)} dependency versions in {maven_index_duration:.3f}s")
 
             def dependency_check(cmd, out):
                 if not java:
@@ -784,20 +923,40 @@ def execute(options, system, arch):
                     raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
                 database = vulnerability_cache("dependency-check", home / "dependency-check-data")
                 args = ["--project", project.name, "--format", "JSON", "--out", out.parent,
-                        "--data", database, "--scan", deps]
+                        "--data", database, "--scan", deps,
+                        "--exclude", "**/maven-dependency-tree.json",
+                        "--exclude", "**/gradle-dependency-paths-*.json"]
                 for artifact in files["jars"]:
                     args.extend(("--scan", artifact))
-                invoke(cmd, *args)
+                if nvd_mirror:
+                    args.extend(("--nvdDatafeed", nvd_mirror))
+                if key := os.getenv("NVD_API_KEY"):
+                    if not re.fullmatch(r"[a-zA-Z0-9-]+", key):
+                        raise ValueError("NVD_API_KEY contains unexpected characters")
+                    redactor.add([key])
+                    properties = work / "dependency-check.properties"
+                    properties.write_text(f"nvd.api.key={key}\n", encoding="ascii")
+                    args.extend(("--propertyfile", properties))
+                command_started = time.perf_counter()
+                try:
+                    invoke(cmd, *args)
+                finally:
+                    statuses["dependency-check"]["commandSeconds"] = round(time.perf_counter() - command_started, 3)
+
+            excludes = ["--exclude", "**/.git/**"]
+            for filename in GENERATED_JSON:
+                excludes.extend(("--exclude", f"**/{filename}"))
+            for path in scan_exclusions:
+                excludes.extend(("--exclude", "./" + path.as_posix()))
 
             def syft(cmd, out):
                 # Inventory the resolved dependencies independently of the original project
                 # so package-manager dependencies and existing application artifacts are represented.
                 prepare_dependencies()
-                if resolution_error:
-                    raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
-                excludes = [flag for file in GENERATED_JSON for flag in ("--exclude", f"**/{file}")]
-                invoke(cmd, "scan", f"dir:{project}", "--exclude", "**/.git/**", *excludes,
+                invoke(cmd, "scan", f"dir:{project}", *excludes,
                        "-o", f"cyclonedx-json={out}")
+                if resolution_error:
+                    raise RuntimeError(f"SBOM only covers files in the project; dependency resolution failed: {resolution_error}")
                 if not builds:
                     return
                 resolved = work / "resolved-sbom.json"
@@ -824,15 +983,21 @@ def execute(options, system, arch):
                                           for ref, targets in references.items()]
                 write_json(out, report)
 
-            def run_grype(cmd, target, out):
+            def run_grype(cmd, target, out, *extra):
                 database = vulnerability_cache("grype", Path(os.environ.get("GRYPE_DB_CACHE_DIR") or home / "grype-db"))
-                invoke(cmd, target, "-o", "json", "--file", out,
-                       env={**os.environ, "GRYPE_DB_CACHE_DIR": str(database)})
+                invoke(cmd, target, "-o", "json", "--file", out, *extra,
+                       env={**installer.scratch_env, "GRYPE_DB_CACHE_DIR": str(database)})
 
             def grype_sbom(cmd, out):
-                if statuses["syft"]["status"] != "success":
-                    raise RuntimeError("A successful Syft SBOM is required for package scanning")
-                run_grype(cmd, f"sbom:{work / REPORTS['syft']}", out)
+                syft_status = statuses["syft"]
+                if syft_status["status"] == "success" and syft_status.get("inventoryCount") is not None:
+                    run_grype(cmd, f"sbom:{work / REPORTS['syft']}", out)
+                    return
+                statuses["grype"]["packageScanMode"] = "direct-directory"
+                run_grype(cmd, f"dir:{project}", out, *excludes)
+                if builds:
+                    raise RuntimeError("Grype directory scan completed with partial Java coverage. "
+                                       "A complete Syft SBOM is required for resolved build dependencies.")
 
             def grype_image(cmd, out):
                 if not docker:
@@ -881,19 +1046,35 @@ def execute(options, system, arch):
                         shutil.move(raw, out)
 
             setup = "Setup-only mode" if options.setup_only else None
-            execute_scan("gitleaks", lambda cmd, out: invoke(
-                cmd, "dir", project, "--config", KIT / ".gitleaks.toml",
-                "--report-format", "json", "--report-path", out, "--redact=0", "--exit-code", "0"), setup)
+            def gitleaks(cmd, out):
+                config = KIT / ".gitleaks.toml"
+                if scan_exclusions:
+                    # Match both native Windows separators and portable relative paths.
+                    patterns = [r"(?:^|[\\/])" + r"[\\/]".join(map(re.escape, path.parts)) + "$"
+                                for path in scan_exclusions]
+                    content = config.read_text(encoding="utf-8")
+                    content = content.replace("paths = [", "paths = [" + ", ".join(
+                        json.dumps(pattern, ensure_ascii=False) for pattern in patterns) + ", ", 1)
+                    config = work / ".gitleaks.toml"
+                    config.write_text(content, encoding="utf-8")
+                invoke(cmd, "dir", project, "--config", config, "--report-format", "json",
+                       "--report-path", out, "--redact=0", "--exit-code", "0")
+
+            execute_scan("gitleaks", gitleaks, setup)
             execute_scan("semgrep", lambda cmd, out: invoke(
                 cmd, "scan", "--config", KIT / "semgrep.yml", "--metrics=off", "--disable-version-check",
                 *(f"--exclude={filename}" for filename in GENERATED_JSON),
-                "--json", "--output", out, project), setup or applicability["semgrep"])
+                *(f"--exclude=/{path.as_posix()}" for path in scan_exclusions),
+                "--json", "--output", out, project, env=installer.semgrep_env), setup or applicability["semgrep"])
             execute_scan("dependency-check", dependency_check, setup or applicability["dependency-check"])
             execute_scan("syft", syft, setup or applicability["syft"])
             execute_scan("grype", grype, setup or applicability["grype"])
             execute_scan("checkov", checkov, setup or applicability["checkov"])
             if java_needed and resolved_dependencies:
-                contexts = dependency_contexts(project, builds, deps, diagnostics.append, files["maven"])
+                contexts = dependency_contexts(
+                    project, builds, deps, diagnostics.append, files["maven"],
+                    maven_reports=maven_reports, declaration_lookup=declaration_lookup,
+                )
 
         log.seek(0)
         (report_dir / "run.log").write_text(redactor.text(log.read()), encoding="utf-8")
@@ -912,9 +1093,12 @@ def execute(options, system, arch):
                "installations": installer.records,
                "scanners": statuses,
                "vulnerabilityCaches": vulnerability_caches,
+               "mavenIndexDurationSeconds": maven_index_duration,
                "toolVersions": {name: entry.get("version") for name, entry in installer.records.items()},
                "totalFindings": len(issues), "findingsBySeverity": dict(Counter(x["severity"] for x in issues)),
-               "findingsByScanner": {name: len(entry["findings"]) for name, entry in statuses.items()},
+               "requiredScanners": sorted(policy),
+               "dependencyResolutionSeconds": dependency_resolution_seconds,
+               "findingsByScanner": {name: entry["findingCount"] for name, entry in statuses.items()},
                "sbomComponentCount": statuses["syft"].get("inventoryCount"), "issues": issues,
                "log": str(report_dir / "run.log")}
     summary["totalDurationSeconds"] = round(time.perf_counter() - total_started, 2)
@@ -926,6 +1110,11 @@ def execute(options, system, arch):
     failed = (any(record["status"] in failures for name, record in installer.records.items()
                    if name in required or name not in REPORTS)
               or any(entry["status"] == "failed" for entry in statuses.values()))
+    if not options.setup_only:
+        unmet = sorted(name for name in policy if statuses[name]["status"] != "success")
+        if unmet:
+            emit("Required scanners did not complete successfully: " + ", ".join(unmet))
+            failed = True
     inventory = None
     if sbom_path := statuses["syft"]["report"]:
         try:
@@ -934,12 +1123,12 @@ def execute(options, system, arch):
             pass
     counts, remediation_count, grouped = terminal_summary(
         issues, terminal_metadata, project, contexts, emit, details=options.details,
-        statuses=statuses, inventory=inventory,
+        statuses=statuses, inventory=inventory, declaration_lookup=declaration_lookup,
     )
     emit("\n=== Security Summary ===")
     emit(f"Scanner execution: {'failed' if failed else 'completed'} ({summary['totalDurationSeconds']:.2f}s)")
     executions = Counter(entry["status"] for entry in statuses.values())
-    emit("Scanner status: " + " | ".join(f"{executions[state]} {state}" for state in ("success", "failed", "skipped")))
+    emit("Scanner status: " + " | ".join(f"{executions[state]} {state}" for state in ("success", "failed", "skipped", "unavailable")))
     validation = "findings require review" if issues else "no findings reported by completed scans"
     if options.setup_only:
         validation = "not run (setup only)"
@@ -971,11 +1160,11 @@ def execute(options, system, arch):
     return int(failed)
 
 
-def main():
+def main(*, in_memory_preview=False):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
     try:
-        return execute(args_for(), *detect())
+        return execute(args_for(), *detect(), in_memory_preview=in_memory_preview)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"Starter kit failed: {error}", file=sys.stderr)
         return 2

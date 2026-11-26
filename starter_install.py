@@ -5,11 +5,13 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -21,9 +23,10 @@ RELEASES = {
     "dependency-check": ("dependency-check/DependencyCheck", "12.2.2"),
 }
 PYPI = {"semgrep": "1.186.0", "checkov": "3.2.495"}
+BOOTSTRAP_PIP = "25.3"
 MINIMUM = {
     "git": (2, 30), "java": (11,), "mvn": (3, 6), "gradle": (7,),
-    "docker": (20, 10), "gitleaks": (8, 19), "syft": (1, 57),
+    "docker": (20, 10), "gitleaks": (8, 19), "syft": (1, 55),
     "grype": (0, 121), "semgrep": (1, 150), "checkov": (3, 2),
     "dependency-check": (12, 1),
 }
@@ -61,27 +64,102 @@ def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,),
                 raise RuntimeError("A Windows batch argument contains an unsafe shell character")
             quoted = " ".join(f'"{arg}"' for arg in args)
             args = f'"{os.environ["COMSPEC"]}" /d /v:off /s /c "{quoted}"'
-    result = subprocess.run(
+    with subprocess.Popen(
         args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
         stdout=subprocess.PIPE if capture else log, stderr=subprocess.STDOUT,
-        timeout=timeout, encoding="utf-8", errors="replace",
-    )
-    if result.returncode not in accepted:
-        raise RuntimeError(f"Command exited with status {result.returncode}")
-    return result.stdout or ""
+        encoding="utf-8", errors="replace", start_new_session=os.name != "nt",
+    ) as process:
+        job = windows_process_job(process) if os.name == "nt" else None
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            stop_process_tree(process, job)
+            process.communicate()
+            if isinstance(error, KeyboardInterrupt):
+                raise
+            raise RuntimeError(f"Command exceeded the {timeout}-second timeout") from error
+        finally:
+            if job:
+                kernel, handle = job
+                kernel.CloseHandle(handle)
+        if process.returncode not in accepted:
+            if capture and log is not None:
+                print(output, file=log, flush=True)
+            raise RuntimeError(f"Command exited with status {process.returncode}")
+    return output or ""
+
+
+def windows_process_job(process):
+    # Group Windows batch launchers with their child scanner processes.
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.CreateJobObjectW(None, None)
+    if handle:
+        if kernel.AssignProcessToJobObject(handle, process._handle):
+            return kernel, handle
+        kernel.CloseHandle(handle)
+    return None
+
+
+def stop_process_tree(process, job):
+    if job:
+        kernel, handle = job
+        if kernel.TerminateJobObject(handle, 1):
+            return
+    if os.name == "nt":
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        try:
+            subprocess.run(
+                [system / "taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if process.poll() is None:
+            process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def fetch(url, output=None, algorithm="sha256"):
+    if not url.startswith("https://"):
+        raise ValueError("Tool downloads require HTTPS")
     request = urllib.request.Request(url, headers={"User-Agent": "accidion-starter-kit"})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        if output is None:
-            return response.read(4 * 1024 * 1024 + 1)
-        digest = hashlib.new(algorithm)
-        with output.open("wb") as target:
-            for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                digest.update(chunk)
-                target.write(chunk)
-        return digest.hexdigest()
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if not response.geturl().startswith("https://"):
+                    raise ValueError("Tool download redirected to a non-HTTPS URL")
+                if output is None:
+                    content = response.read(4 * 1024 * 1024 + 1)
+                    if len(content) > 4 * 1024 * 1024:
+                        raise ValueError("Release metadata exceeds the download limit")
+                    return content
+                digest = hashlib.new(algorithm)
+                with output.open("wb") as target:
+                    for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        target.write(chunk)
+                return digest.hexdigest()
+        except urllib.error.HTTPError as error:
+            if error.code not in {408, 500, 502, 503, 504} or attempt == 2:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            cause = getattr(error, "reason", error)
+            if not isinstance(cause, (TimeoutError, ConnectionError)) or attempt == 2:
+                raise
+        time.sleep(2 ** attempt)
 
 
 def unpack(archive, destination):
@@ -181,26 +259,35 @@ class Installer:
     def __init__(self, system, arch, cache, allow, log):
         self.system, self.arch, self.cache, self.allow, self.log = system, arch, cache, allow, log
         self.records = {}
+        self.scratch_env = {}
+        self.semgrep_env = {}
 
     def version(self, name, cmd, cwd=None):
         flag = {"gitleaks": "version", "syft": "version", "grype": "version"}.get(name, "--version")
         if name == "java":
             flag = "-version"
             java = Path(shutil.which(str(cmd[0])) or cmd[0]).resolve()
+            if self.system == "macos" and java == Path("/usr/bin/java"):
+                java_home = Path(run(["/usr/libexec/java_home"], capture=True, timeout=30).strip())
+                java = java_home / "bin/java"
+                cmd[0] = str(java)
             javac = java.with_name("javac.exe" if os.name == "nt" else "javac")
             if not javac.exists():
                 raise RuntimeError("A JDK with javac is required")
             run([javac, "-version"], capture=True, timeout=30)
-        output = run([*cmd, flag], cwd=cwd, capture=True, timeout=180)
-        match = re.search(r"\b(\d+\.\d+(?:\.\d+)?)\b", output)
+        if self.log is not None:
+            print(f"\n--- {name} version check ---", file=self.log, flush=True)
+        tool_env = self.semgrep_env if name == "semgrep" else self.scratch_env
+        env = {**os.environ, **tool_env} if tool_env else None
+        output = run([*cmd, flag], cwd=cwd, capture=True, log=self.log, timeout=180, env=env)
+        pattern = (r"(?mi)^Version:\s*(\d+\.\d+(?:\.\d+)?)"
+                   if name in {"syft", "grype"} and "Version:" in output
+                   else r"\b(\d+\.\d+(?:\.\d+)?)\b")
+        match = re.search(pattern, output)
         if not match or tuple(map(int, match[1].split("."))) < MINIMUM[name]:
             raise RuntimeError("Version is missing or below the supported minimum")
         if name == "java":
             java_home = java.parent.parent
-            if self.system == "macos" and java == Path("/usr/bin/java"):
-                java_home = Path(run(["/usr/libexec/java_home"], capture=True, timeout=30).strip())
-                if not (java_home / "bin/javac").is_file():
-                    raise RuntimeError("macOS Java shim did not resolve to a JDK")
             os.environ["JAVA_HOME"] = str(java_home)
             os.environ["PATH"] = f"{java.parent}{os.pathsep}{os.environ['PATH']}"
         return match[1]
@@ -211,26 +298,51 @@ class Installer:
         ensure_started = time.perf_counter()
         ensure_started_at = datetime.now(timezone.utc).isoformat()
         status = "unavailable"
+        probe_error = None
         try:
             existing = shutil.which(name)
             java_home = os.environ.get("JAVA_HOME") if name == "java" else None
             java = Path(java_home) / ("bin/java.exe" if os.name == "nt" else "bin/java") if java_home else None
-            candidates = ([wrapper] if wrapper else
-                          [[java] if java and java.is_file() else None, [existing] if existing else None, self.managed(name)])
+            candidates = [wrapper, [java] if java and java.is_file() else None,
+                          [existing] if existing else None, self.managed(name)]
+            if name == "semgrep" and self.system == "windows":
+                candidates = [candidate for cmd in filter(None, candidates)
+                              for candidate in (cmd, [*cmd, "--legacy"])]
+            if name == "checkov" and self.system == "windows":
+                if existing:
+                    scripts = Path(existing).parent
+                    for python in (scripts / "python.exe", scripts.parent / "python.exe"):
+                        if python.is_file():
+                            candidates.append([python, "-I", "-m", "checkov.main"])
+                candidates.append([sys.executable, "-I", "-m", "checkov.main"])
             for cmd in filter(None, candidates):
                 try:
                     version = self.version(name, cmd, cwd)
-                except (OSError, RuntimeError, subprocess.SubprocessError):
-                    if wrapper:
-                        raise
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    probe_error = error
+                    if self.log is not None:
+                        print(f"{name} version check failed: {error}", file=self.log, flush=True)
                     continue
                 self.records[name] = {"status": "reused", "version": version}
                 return cmd
             if not self.allow:
-                raise RuntimeError("Missing or incompatible; installation disabled")
+                detail = f" Last version check: {probe_error}" if probe_error else ""
+                raise RuntimeError(f"Missing or incompatible; installation disabled.{detail}")
+            if name == "semgrep" and (self.system, self.arch) in {
+                ("macos", "amd64"), ("windows", "arm64"),
+            }:
+                raise RuntimeError(f"Semgrep {PYPI[name]} publishes no native wheel for "
+                                   f"{self.system}/{self.arch}; use an approved compatible installation")
             status = "installation_failed"
             cmd = self.install(name)
-            self.records[name] = {"status": "installed", "version": self.version(name, cmd, cwd)}
+            try:
+                version = self.version(name, cmd, cwd)
+            except RuntimeError:
+                if name != "semgrep" or self.system != "windows":
+                    raise
+                cmd = [*cmd, "--legacy"]
+                version = self.version(name, cmd, cwd)
+            self.records[name] = {"status": "installed", "version": version}
             return cmd
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             self.records[name] = {"status": status, "reason": str(error)}
@@ -287,17 +399,27 @@ class Installer:
 
     def install_pypi(self, name):
         base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
-        created = not base.exists()
-        try:
-            run([sys.executable, "-m", "venv", base], log=self.log)
-        except RuntimeError:
-            if self.system != "linux":
-                raise
-            run(package_command(self.system, "pip"), log=self.log)
-            run([sys.executable, "-m", "venv", base], log=self.log)
         python = base / ("Scripts/python.exe" if self.system == "windows" else "bin/python")
-        pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
-        self.records[f"pip:{name}"] = {"status": "installed" if created else "reused", "version": pip.split()[1]}
+        try:
+            pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
+        except (OSError, RuntimeError):
+            try:
+                run([sys.executable, "-m", "venv", base], log=self.log)
+            except RuntimeError:
+                if self.system != "linux":
+                    raise
+                if linux_family() == "debian":
+                    # Debian can ship the system interpreter without ensurepip.
+                    run([sys.executable, "-m", "venv", "--without-pip", base], log=self.log)
+                    self.bootstrap_pip(python)
+                else:
+                    run(package_command(self.system, "pip"), log=self.log)
+                    run([sys.executable, "-m", "venv", base], log=self.log)
+            pip = run([python, "-m", "pip", "--version"], capture=True, log=self.log, timeout=60)
+            status = "installed"
+        else:
+            status = "reused"
+        self.records[f"pip:{name}"] = {"status": status, "version": pip.split()[1]}
         try:
             run([python, "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
                  "--retries", "2", f"{name}=={PYPI[name]}"], log=self.log)
@@ -305,6 +427,20 @@ class Installer:
             raise RuntimeError(f"Could not install {name} {PYPI[name]} wheels for {self.system}/{self.arch} "
                                f"with Python {sys.version_info.major}.{sys.version_info.minor}. "
                                "Check wheel availability and the approved package index in run.log.") from error
+
+    def bootstrap_pip(self, python):
+        filename = f"pip-{BOOTSTRAP_PIP}-py3-none-any.whl"
+        release = json.loads(fetch(f"https://pypi.org/pypi/pip/{BOOTSTRAP_PIP}/json"))
+        wheel = next((item for item in release.get("urls", []) if item["filename"] == filename), None)
+        if not wheel or not wheel["url"].startswith("https://files.pythonhosted.org/"):
+            raise RuntimeError(f"PyPI did not publish the expected pip wheel ({filename})")
+        with tempfile.TemporaryDirectory(dir=self.cache) as temporary:
+            archive = Path(temporary) / filename
+            if fetch(wheel["url"], archive) != wheel["digests"]["sha256"]:
+                raise RuntimeError("Download checksum mismatch for pip")
+            launch = "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__')"
+            run([python, "-I", "-c", launch, archive, "--disable-pip-version-check", "install",
+                 "--no-index", "--no-deps", archive], log=self.log, timeout=120)
 
     def install_archive(self, name):
         version = self.release_version(name)

@@ -1,0 +1,123 @@
+name: Standalone security scan
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      live_scanners:
+        description: Download scanners and vulnerability databases, then run the copied script
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify reproducible LF distribution and Bash syntax
+        run: |
+          python scripts/build_standalone.py --check
+          bash -n dist/security-scan.sh
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Verify stock macOS Bash 3.2
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash -c '[[ ${BASH_VERSINFO[0]} == 3 && ${BASH_VERSINFO[1]} == 2 ]]'
+          app="$RUNNER_TEMP/legacy bash app"
+          mkdir -p "$app"
+          cp dist/security-scan.sh "$app/"
+          cd "$app"
+          /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
+          printf 'SCANNERS=gitleaks\n' > security-scan.properties
+          /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
+
+  live:
+    if: github.event_name == 'workflow_dispatch' && inputs.live_scanners
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Copy only the distribution and create application fixtures
+        run: |
+          app="$RUNNER_TEMP/fresh application"
+          mkdir -p "$app"
+          cp dist/security-scan.sh "$app/"
+          printf '%s\n' 'class Example {}' > "$app/Example.java"
+          printf '%s\n' 'FROM scratch' 'COPY Example.java /Example.java' > "$app/Dockerfile"
+          printf '%s\n' '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>example</groupId><artifactId>fixture</artifactId><version>1.0</version><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version></dependency></dependencies></project>' > "$app/pom.xml"
+      - name: Bootstrap and reuse Python with no interpreter on PATH
+        if: runner.os == 'Linux'
+        run: |
+          bin="$RUNNER_TEMP/bootstrap-bin"
+          mkdir -p "$bin"
+          for tool in uname dirname cat mktemp rm curl awk sha256sum tar gzip mkdir find chmod git; do
+            ln -s "$(command -v "$tool")" "$bin/$tool"
+          done
+          export ACCIDION_HOME="$RUNNER_TEMP/clean bootstrap home"
+          export UV_PYTHON_INSTALL_DIR="$RUNNER_TEMP/managed python"
+          cd "$RUNNER_TEMP/fresh application"
+          PATH="$bin" /bin/bash security-scan.sh --setup-only --scanner gitleaks
+          PATH="$bin" /bin/bash security-scan.sh --dry-run --no-install --scanner gitleaks | grep '"platform": "linux"'
+      - name: Provision missing scanners and reuse them in a real scan
+        env:
+          LIVE_SCANNERS: ${{ matrix.os == 'macos-15-intel' && 'gitleaks,dependency-check,syft,grype,checkov' || 'all' }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          export ACCIDION_HOME="$RUNNER_TEMP/clean accidion home"
+          cd "$RUNNER_TEMP/fresh application"
+          bash security-scan.sh --setup-only --scanner "$LIVE_SCANNERS" --verbose
+          bash security-scan.sh --no-install --scanner "$LIVE_SCANNERS" --verbose
+      - name: Verify all applicable report files and scanner reuse
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          home = Path(os.environ["RUNNER_TEMP"]) / "clean accidion home"
+          path = max((home / "reports").rglob("security-summary.json"),
+                     key=lambda report: report.stat().st_mtime)
+          summary = json.loads(path.read_text(encoding="utf-8"))
+          for scanner, entry in summary["scanners"].items():
+              if scanner == "semgrep" and summary["platform"] == "macos" and summary["architecture"] == "amd64":
+                  assert entry["status"] == "skipped", entry
+                  continue
+              assert entry["status"] == "success", (scanner, entry["reason"])
+              assert entry["installationStatus"] == "reused", scanner
+              json.loads(Path(entry["report"]).read_text(encoding="utf-8"))
+          PY
+      - name: Build and scan a local Docker image
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          export ACCIDION_HOME="$RUNNER_TEMP/clean accidion home"
+          cd "$RUNNER_TEMP/fresh application"
+          bash security-scan.sh --no-install --scanner grype --build-image
