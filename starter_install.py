@@ -56,6 +56,10 @@ def release_asset(name, version, system, arch):
     return f"{name}_{version}_{os_name}_{arch}.{extension}"
 
 
+class CommandTimeout(RuntimeError):
+    pass
+
+
 def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,), env=None):
     args = [str(arg) for arg in args]
     if os.name == "nt":
@@ -78,7 +82,7 @@ def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,),
             process.communicate()
             if isinstance(error, KeyboardInterrupt):
                 raise
-            raise RuntimeError(f"Command exceeded the {timeout}-second timeout") from error
+            raise CommandTimeout(f"Command exceeded the {timeout}-second timeout") from error
         finally:
             if job:
                 kernel, handle = job
@@ -137,6 +141,56 @@ def stop_process_tree(process, job):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def recover_dependency_check_lock(database, *, wait_for_release=False):
+    if os.name != "nt":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                               ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                  ctypes.c_void_p, wintypes.DWORD]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    read_and_delete = 0x80000000 | 0x00010000
+    open_existing, open_reparse_point = 3, 0x00200000
+    path = str(database / "odc.update.lock")
+    # Dependency-Check holds a file handle for the lifetime of its update lock.
+    # Open with no sharing and delete by handle to avoid a check/unlink race.
+    invalid_handle = ctypes.c_void_p(-1).value
+    sharing_violation = 32
+    deadline = time.monotonic() + (2 if wait_for_release else 0)
+    while True:
+        handle = kernel.CreateFileW(path, read_and_delete, 0, None, open_existing, open_reparse_point, None)
+        if handle != invalid_handle:
+            break
+        if ctypes.get_last_error() != sharing_violation or time.monotonic() >= deadline:
+            return False
+        # Windows may still be releasing the Java process's handles after termination.
+        time.sleep(0.05)
+    try:
+        marker = ctypes.create_string_buffer(33)
+        count = wintypes.DWORD()
+        if not kernel.ReadFile(handle, marker, len(marker), ctypes.byref(count), None):
+            return False
+        # Dependency-Check writes the marker only after taking the native lock.
+        # An empty file may belong to a process that is still acquiring it.
+        if not re.fullmatch(rb"[0-9a-fA-F]{32}", marker.raw[:count.value]):
+            return False
+        disposition = ctypes.c_ubyte(1)
+        file_disposition_info = 4
+        return bool(kernel.SetFileInformationByHandle(
+            handle, file_disposition_info, ctypes.byref(disposition), ctypes.sizeof(disposition)
+        ))
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def fetch(url, output=None, algorithm="sha256"):

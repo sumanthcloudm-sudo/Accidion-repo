@@ -42,9 +42,16 @@ jobs:
           mkdir -p "$app"
           cp dist/security-scan.sh "$app/"
           cd "$app"
+          export ACCIDION_HOME="$RUNNER_TEMP/legacy tool home"
+          /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
+          /bin/bash security-scan.sh --no-install --scanner dependency-check --report-dir "$RUNNER_TEMP/legacy reports"
+          test -f security-scan.properties
+          printf 'PROJECT_ROOT=\nOUTPUT_DIR=\nSCANNERS=\nDOCKER_IMAGE=\nBUILD_IMAGE=\n' > security-scan.properties
           /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
           printf 'SCANNERS=gitleaks\n' > security-scan.properties
           /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
+          printf 'SCANNERS=dependency-check\nOUTPUT_DIR=\n' > security-scan.properties
+          /bin/bash security-scan.sh
 
   live:
     if: github.event_name == 'workflow_dispatch' && inputs.live_scanners

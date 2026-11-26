@@ -11,7 +11,7 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 import starter_kit as kit
-from starter_install import Installer, run
+from starter_install import Installer, recover_dependency_check_lock, run
 from test_starter_kit import host_bash
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -184,6 +184,7 @@ class StandaloneTests(unittest.TestCase):
             (project / "requirements.txt").write_text("requests==2.32.5\n", encoding="utf-8")
             args = kit.args_for(["--project-path", str(project), "--scanner", "grype", "--no-install"])
             targets = []
+            scratch_paths = []
 
             def ensure(installer, name, **kwargs):
                 if name == "syft":
@@ -198,6 +199,13 @@ class StandaloneTests(unittest.TestCase):
                 if command[0] != "grype":
                     return native_run(command, **kwargs)
                 targets.append(command[1])
+                env = kwargs["env"]
+                scratch = Path(env["SQLITE_TMPDIR"])
+                self.assertEqual(scratch.parent, Path(env["GRYPE_DB_CACHE_DIR"]))
+                self.assertTrue(scratch.is_dir())
+                for name in ("TMPDIR", "TEMP", "TMP"):
+                    self.assertEqual(Path(env[name]), scratch)
+                scratch_paths.append(scratch)
                 report = Path(command[command.index("--file") + 1])
                 kit.write_json(report, {"matches": []})
 
@@ -212,6 +220,28 @@ class StandaloneTests(unittest.TestCase):
             self.assertEqual(statuses["syft"]["status"], "unavailable")
             self.assertEqual(statuses["grype"]["status"], "success")
             self.assertEqual(targets, [f"dir:{project}"])
+            self.assertTrue(all(not path.exists() for path in scratch_paths))
+
+    @unittest.skipUnless(os.name == "nt", "Uses Windows file sharing")
+    def test_dependency_check_recovers_only_orphaned_update_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory)
+            lock = database / "odc.update.lock"
+            data = database / "odc.mv.db"
+            data.write_bytes(b"database fixture")
+            self.assertFalse(recover_dependency_check_lock(database))
+            for marker in (b"", b"unknown format"):
+                lock.write_bytes(marker)
+                self.assertFalse(recover_dependency_check_lock(database))
+                self.assertEqual(lock.read_bytes(), marker)
+            marker = b"0123456789abcdef" * 2
+            lock.write_bytes(marker)
+            with lock.open("rb"):
+                self.assertFalse(recover_dependency_check_lock(database))
+                self.assertEqual(lock.read_bytes(), marker)
+            self.assertTrue(recover_dependency_check_lock(database))
+            self.assertFalse(lock.exists())
+            self.assertEqual(data.read_bytes(), b"database fixture")
 
     def test_timeout_stops_scanner_children(self):
         with tempfile.TemporaryDirectory() as directory:

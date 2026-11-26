@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
-from starter_install import Installer, detect, refresh_windows_path, run
+from starter_install import CommandTimeout, Installer, detect, recover_dependency_check_lock, refresh_windows_path, run
 from starter_findings import (
     NAMES, NORMALIZE, SEVERITIES, Redactor, capture_secrets, find_maven_declaration, issue_identifier,
     project_source, source_label, terminal_field, terminal_summary,
@@ -938,8 +938,14 @@ def execute(options, system, arch, *, in_memory_preview=False):
                     properties.write_text(f"nvd.api.key={key}\n", encoding="ascii")
                     args.extend(("--propertyfile", properties))
                 command_started = time.perf_counter()
+                if recover_dependency_check_lock(database):
+                    print("Dependency-Check | Removed an orphaned update lock before scanning", file=log)
                 try:
                     invoke(cmd, *args)
+                except (CommandTimeout, KeyboardInterrupt):
+                    if recover_dependency_check_lock(database, wait_for_release=True):
+                        print("Dependency-Check | Removed an orphaned update lock after scanning", file=log)
+                    raise
                 finally:
                     statuses["dependency-check"]["commandSeconds"] = round(time.perf_counter() - command_started, 3)
 
@@ -985,8 +991,12 @@ def execute(options, system, arch, *, in_memory_preview=False):
 
             def run_grype(cmd, target, out, *extra):
                 database = vulnerability_cache("grype", Path(os.environ.get("GRYPE_DB_CACHE_DIR") or home / "grype-db"))
-                invoke(cmd, target, "-o", "json", "--file", out, *extra,
-                       env={**installer.scratch_env, "GRYPE_DB_CACHE_DIR": str(database)})
+                # SQLite hydration can require gigabytes of temporary space. Use the
+                # cache filesystem so a small report or system temp filesystem is irrelevant.
+                with tempfile.TemporaryDirectory(prefix="grype-scratch-", dir=database) as scratch:
+                    env = dict.fromkeys(("TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR"), scratch)
+                    invoke(cmd, target, "-o", "json", "--file", out, *extra,
+                           env={**env, "GRYPE_DB_CACHE_DIR": str(database)})
 
             def grype_sbom(cmd, out):
                 syft_status = statuses["syft"]
