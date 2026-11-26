@@ -77,11 +77,22 @@ class StarterKitTests(unittest.TestCase):
 
     def test_missing_arm_package_is_reported_without_download(self):
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(starter_install, "fetch", return_value=b'{"assets": []}') as fetch:
+             patch.object(starter_install, "fetch") as fetch:
             installer = starter_install.Installer("windows", "arm64", Path(directory), True, None)
-            with self.assertRaisesRegex(RuntimeError, r"No upstream gitleaks .* windows/arm64"):
+            with self.assertRaisesRegex(RuntimeError, r"No verified upstream grype .* windows/arm64"):
+                installer.install_archive("grype")
+            fetch.assert_not_called()
+
+    def test_pinned_release_rejects_checksum_mismatch_without_api_request(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(starter_install, "fetch", return_value="0" * 64) as fetch:
+            installer = starter_install.Installer("macos", "arm64", Path(directory), True, None)
+            with self.assertRaisesRegex(RuntimeError, r"Download checksum mismatch"):
                 installer.install_archive("gitleaks")
             fetch.assert_called_once()
+            url, _, algorithm = fetch.call_args.args
+            self.assertTrue(url.startswith("https://github.com/gitleaks/gitleaks/releases/download/"))
+            self.assertEqual(algorithm, "sha256")
 
     def test_native_launcher_and_private_report_directory(self):
         bash = host_bash()
@@ -340,7 +351,7 @@ public class Main {
         for system, arch in [("windows", "amd64"), ("macos", "arm64"),
                              ("macos", "amd64"), ("linux", "amd64")]:
             with self.subTest(system=system, arch=arch), tempfile.TemporaryDirectory() as root:
-                project = Path(root) / "external app"
+                project = Path(root).resolve() / "external app"
                 self.populate(project)
                 discovered = kit.discover(project)
                 self.assertEqual(len(discovered["java"]), 1)
@@ -355,7 +366,7 @@ public class Main {
                     installer.records[name] = {"status": "reused", "version": "123.4"}
                     return [name]
 
-                home = Path(root) / "kit-data"
+                home = Path(root).resolve() / "kit-data"
                 with patch.dict(os.environ, {"ACCIDION_HOME": str(home), "ACCIDION_KIT_COMMIT": "1" * 40,
                                              "ACCIDION_KIT_ARCHIVE_SHA256": "2" * 64}), \
                      patch.object(kit.Installer, "ensure", ensure), \
@@ -1065,7 +1076,7 @@ class BootstrapTests(unittest.TestCase):
             '[[ " $* " == *" --config - "* ]] || { echo "missing stdin config" >&2; exit 10; }\n'
             'read -r auth\n[[ $auth == "header = \\"Authorization: Bearer $MOCK_TOKEN\\"" ]] || { echo "unexpected bearer" >&2; exit 10; }\n'
             'case " $* " in\n'
-            '  *"https://api.github.com/user "*) [[ ${MOCK_USER_DENIED:-0} == 0 ]]; printf 200; exit ;;\n'
+            '  *"https://api.github.com/user "*) [[ ${MOCK_USER_DENIED:-0} == 0 ]] || exit 22; printf 200; exit ;;\n'
             '  *"/contents/bootstrap.sh?ref=$MOCK_PIN "*) input=$MOCK_BOOTSTRAP ;;\n'
             '  *"/tarball/$MOCK_PIN "*) [[ ${MOCK_ARCHIVE_FAIL:-0} == 0 ]] || exit 22; input=$MOCK_ARCHIVE ;;\n'
             '  *) exit 11 ;;\nesac\n'

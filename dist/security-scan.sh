@@ -1187,7 +1187,7 @@ def main(*, in_memory_preview=False):
 if __name__ == "__main__":
     sys.exit(main())
 ACCIDION_81409f8e1d2acf44248ba5c803c147dbc142f86af7091f0ab79b569ff282dba3
-  command cat > "$1/starter_install.py" <<'ACCIDION_d03da74dc28b3ed72bec86338a432b0fa7bd4ef8d9ce70e92dfcddb68bb4ef12'
+  command cat > "$1/starter_install.py" <<'ACCIDION_e6cd7c12a9ce23f7a6094a8790d4d6bd761250abd30d52ac95572dde14a0d440'
 """Platform adapters and verified, user-local tool provisioning."""
 import hashlib
 import json
@@ -1211,6 +1211,27 @@ RELEASES = {
     "syft": ("anchore/syft", "1.57.1"),
     "grype": ("anchore/grype", "0.121.3"),
     "dependency-check": ("dependency-check/DependencyCheck", "12.2.2"),
+}
+# SHA-256 digests published with the pinned GitHub release assets.
+RELEASE_SHA256 = {
+    "gitleaks_8.30.1_darwin_arm64.tar.gz": "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
+    "gitleaks_8.30.1_darwin_x64.tar.gz": "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
+    "gitleaks_8.30.1_linux_arm64.tar.gz": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+    "gitleaks_8.30.1_linux_x64.tar.gz": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+    "gitleaks_8.30.1_windows_arm64.zip": "b95f5e4f5c425cedca7ee203d9afd29597e692c4924a12ed42f970537c72cc0f",
+    "gitleaks_8.30.1_windows_x64.zip": "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e",
+    "syft_1.57.1_darwin_amd64.tar.gz": "2355758c1142982a67b309604c5d75effdbe638a57c771979ea8fd1a16656abc",
+    "syft_1.57.1_darwin_arm64.tar.gz": "e0a74a5d2688d1254b4e17b71f068a83215e3625f846265bf6614c7ba06f3a96",
+    "syft_1.57.1_linux_amd64.tar.gz": "bf52519eb57f675d47c07d43213cb6dff6449f3d6d1147ff6701ed91f44eef0c",
+    "syft_1.57.1_linux_arm64.tar.gz": "aa3d3e07344f590bcce8d31043b752daa76c8a56c2aa34ceeee63c6168152582",
+    "syft_1.57.1_windows_amd64.zip": "3a01fe865076bb548352195b77e88fa4649277861ea458efe165c3a810b6dcc7",
+    "syft_1.57.1_windows_arm64.zip": "8cdd580b5f7160d12b66c7c5191100a6cf792e130d8a28deeae5ea45e0030e00",
+    "grype_0.121.3_darwin_amd64.tar.gz": "65bfb1b3b30d32e9dab156a60003c7146e619f649992be227bf09c9ccbf44f7e",
+    "grype_0.121.3_darwin_arm64.tar.gz": "54336f2cd8cdee8b3d8ea83462561ff7fa9293498054c7c53a193db44bfea4c8",
+    "grype_0.121.3_linux_amd64.tar.gz": "e9da18cc1429e786722e32161288103600efffd8e483c90761f90485bd1bec85",
+    "grype_0.121.3_linux_arm64.tar.gz": "b7815598d48da78bfd16f5b98ef28e1bb09c03d34fc8c3e350f99b6ccb3c7cba",
+    "grype_0.121.3_windows_amd64.zip": "3007a5afea25c60030a49d6c24d4e5abb6c94c0dbeed7ea303eb26df8e900c18",
+    "dependency-check-12.2.2-release.zip": "bf07fefd81af3094c5f6850423b014df44db62ce2dbad0f79079a90df675e44a",
 }
 PYPI = {"semgrep": "1.186.0", "checkov": "3.2.495"}
 LINUX_JDK = "21.0.11+10"
@@ -1716,15 +1737,12 @@ class Installer:
         elif name in RELEASES:
             repo, _ = RELEASES[name]
             asset_name = release_asset(name, version, self.system, self.arch)
-            release = json.loads(fetch(f"https://api.github.com/repos/{repo}/releases/tags/v{version}"))
-            asset = next((item for item in release["assets"] if item["name"] == asset_name), None)
-            if not asset:
-                raise RuntimeError(f"No upstream {name} {version} package for {self.system}/{self.arch} "
+            expected = RELEASE_SHA256.get(asset_name)
+            if not expected:
+                raise RuntimeError(f"No verified upstream {name} {version} package for {self.system}/{self.arch} "
                                    f"({asset_name}); install a compatible approved binary if available")
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", asset.get("digest") or ""):
-                raise RuntimeError(f"No SHA-256 published for {asset_name}")
             url = f"https://github.com/{repo}/releases/download/v{version}/{asset_name}"
-            algorithm, expected = asset["digest"].split(":")
+            algorithm = "sha256"
         else:
             if name == "mvn":
                 url = f"https://archive.apache.org/dist/maven/maven-3/{version}/binaries/apache-maven-{version}-bin.zip"
@@ -1747,7 +1765,7 @@ class Installer:
             except OSError:
                 if not (destination / ".complete").exists():
                     raise
-ACCIDION_d03da74dc28b3ed72bec86338a432b0fa7bd4ef8d9ce70e92dfcddb68bb4ef12
+ACCIDION_e6cd7c12a9ce23f7a6094a8790d4d6bd761250abd30d52ac95572dde14a0d440
   command cat > "$1/starter_findings.py" <<'ACCIDION_f84ead745374f4fa8f5979cf3c03ce3032bcad71ca080ca8284da0bc22a72687'
 """Map scanner evidence to a common issue schema and scrub published output."""
 import hashlib
