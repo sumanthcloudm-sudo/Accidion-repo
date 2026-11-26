@@ -20,16 +20,16 @@ bootstrap_managed_python() (
 
   command -v curl >/dev/null || exit 1
 
-  tmp="$(mktemp -d)"
+  tmp="$(mktemp -d)" || exit 1
   trap 'rm -rf -- "$tmp"' EXIT
 
   url="https://github.com/astral-sh/uv/releases/download/$version/$asset"
 
   curl --proto '=https' --tlsv1.2 -fsSL \
-    --retry 3 "$url" -o "$tmp/$asset"
+    --connect-timeout 15 --max-time 180 --retry 3 "$url" -o "$tmp/$asset" || exit 1
 
   curl --proto '=https' --tlsv1.2 -fsSL \
-    --retry 3 "$url.sha256" -o "$tmp/checksum"
+    --connect-timeout 15 --max-time 180 --retry 3 "$url.sha256" -o "$tmp/checksum" || exit 1
 
   expected="$(awk 'NR==1 {print $1}' "$tmp/checksum")"
   [[ $expected =~ ^[a-fA-F0-9]{64}$ ]] || exit 1
@@ -48,23 +48,24 @@ bootstrap_managed_python() (
     exit 1
   }
 
-  mkdir -p "$tmp/extracted"
+  mkdir -p "$tmp/extracted" || exit 1
 
   case "$asset" in
     *.zip)
-      unzip -q "$tmp/$asset" -d "$tmp/extracted"
+      unzip -q "$tmp/$asset" -d "$tmp/extracted" || exit 1
       executable=uv.exe ;;
     *)
-      tar -xzf "$tmp/$asset" -C "$tmp/extracted"
+      tar -xzf "$tmp/$asset" -C "$tmp/extracted" || exit 1
       executable=uv ;;
   esac
 
   uv_bin="$(find "$tmp/extracted" -type f \
-    -name "$executable" -print -quit)"
+    -name "$executable" -print)" || exit 1
+  uv_bin="${uv_bin%%$'\n'*}"
 
   [[ -n $uv_bin ]] || exit 1
-  chmod +x "$uv_bin"
+  chmod +x "$uv_bin" || exit 1
 
-  "$uv_bin" python install 3.12 --no-bin >&2
+  "$uv_bin" python install 3.12 --no-bin >&2 || exit 1
   "$uv_bin" python find --managed-python 3.12
 )

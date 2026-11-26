@@ -2,20 +2,24 @@
 import argparse
 import csv
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 import functools
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
-from starter_install import Installer, detect, refresh_windows_path, run
+from starter_install import CommandTimeout, Installer, detect, recover_dependency_check_lock, refresh_windows_path, run
 from starter_findings import (
     NAMES, NORMALIZE, SEVERITIES, Redactor, capture_secrets, find_maven_declaration, issue_identifier,
     project_source, source_label, terminal_field, terminal_summary,
@@ -31,7 +35,14 @@ REPORTS = {
 }
 GENERATED_JSON = (*REPORTS.values(), "grype-sbom-report.json", "security-summary.json")
 IGNORED = {".git", ".gradle", ".venv", "venv", "node_modules", ".terraform",
-           ".cache", "__pycache__", ".pytest_cache", "reports"}
+           ".cache", "__pycache__", ".pytest_cache"}
+MANIFESTS = {
+    "package.json": "javascript", "package-lock.json": "javascript", "yarn.lock": "javascript",
+    "pnpm-lock.yaml": "javascript", "tsconfig.json": "typescript",
+    "pyproject.toml": "python", "pipfile.lock": "python", "poetry.lock": "python", "uv.lock": "python",
+    "go.mod": "go", "go.sum": "go", "packages.lock.json": "dotnet", "packages.config": "dotnet",
+    "cargo.toml": "rust", "cargo.lock": "rust", "gemfile.lock": "ruby", "composer.lock": "php",
+}
 INFRA = (".tf", ".tf.json", ".bicep")
 IAC_MARKERS = re.compile(r'(?m)^\s*(?:apiVersion|AWSTemplateFormatVersion|Resources)\s*:|'
                          r'"(?:apiVersion|AWSTemplateFormatVersion|Resources|[$]schema)"\s*:')
@@ -47,18 +58,20 @@ def infrastructure_file(path):
 
 
 def discover(project):
-    files = {kind: [] for kind in ("java", "maven", "gradle", "jars", "dockerfiles", "iac", "opentofu")}
+    files = {kind: [] for kind in ("java", "maven", "gradle", "jars", "dockerfiles", "iac", "opentofu", "sql",
+                                     *sorted(set(MANIFESTS.values())))}
 
     def raise_walk_error(error):
         raise error
 
     for directory, dirs, names in os.walk(project, onerror=raise_walk_error):
         base = Path(directory)
-        dirs[:] = sorted(d for d in dirs if d not in IGNORED and not (base / d).is_symlink())
+        dirs[:] = sorted(d for d in dirs if d not in IGNORED and d.casefold() != "reports"
+                         and not (base / d).is_symlink())
         generated = bool(set(base.relative_to(project).parts) & {"build", "target"})
         for name in sorted(names):
             path = base / name
-            if path.is_symlink() or not path.is_file():
+            if name in GENERATED_JSON or path.is_symlink() or not path.is_file():
                 continue
             lower = name.lower()
             if lower.endswith((".jar", ".war", ".ear")):
@@ -66,6 +79,14 @@ def discover(project):
                     files["jars"].append(path)
             elif generated:
                 continue
+            elif lower in MANIFESTS:
+                files[MANIFESTS[lower]].append(path)
+            elif lower.startswith("requirements") and lower.endswith(".txt"):
+                files["python"].append(path)
+            elif lower.endswith((".csproj", ".fsproj", ".vbproj", ".deps.json")):
+                files["dotnet"].append(path)
+            elif lower.endswith(".sql"):
+                files["sql"].append(path)
             elif lower.endswith(".java"):
                 files["java"].append(path)
             elif name == "pom.xml":
@@ -134,30 +155,6 @@ def write_json(path, content):
     temporary.replace(path)
 
 
-def export_project_reports(project, report_dir):
-    """Publish sanitized reports in a separate, git-ignored per-run directory."""
-    destination = project / "reports"
-    if destination.is_symlink():
-        raise ValueError("Project reports directory must not be a symlink")
-    destination.mkdir(mode=0o700, exist_ok=True)
-    if destination.resolve().parent != project.resolve():
-        raise ValueError("Project reports directory must remain inside the project")
-    ignore = destination / ".gitignore"
-    if not ignore.exists():
-        with ignore.open("x", encoding="utf-8") as output:
-            output.write("*\n")
-    elif ignore.is_symlink() or "*" not in ignore.read_text(encoding="utf-8").splitlines():
-        raise ValueError("Project reports/.gitignore must contain a '*' rule")
-    exported = destination / report_dir.name
-    exported.mkdir(mode=0o700)
-    for filename in GENERATED_JSON:
-        source = report_dir / filename
-        if source.is_file():
-            with source.open("rb") as original, (exported / filename).open("xb") as output:
-                shutil.copyfileobj(original, output)
-    return exported
-
-
 def report_application_directory(name):
     label = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-_").lower()[:80].rstrip("-_")
     if re.fullmatch(r"con|prn|aux|nul|com[0-9]|lpt[0-9]", label):
@@ -217,7 +214,7 @@ def select_dockerfile(files, project):
     return dockerfiles[0] if len(dockerfiles) == 1 else None
 
 
-def resolve_dependencies(project, builds, out, log, diagnostic):
+def resolve_dependencies(project, builds, out, log, diagnostic, *, timeout=3600):
     failures = []
     for index, (family, root, tool) in enumerate(builds):
         try:
@@ -234,7 +231,7 @@ def resolve_dependencies(project, builds, out, log, diagnostic):
                 args = [*tool, "--no-daemon", "--no-configuration-cache", "--console=plain", "--init-script",
                         KIT / "accidion-dependencies.gradle", f"-PaccidionDependencyDirectory={target}",
                         "accidionCollectDependencies"]
-            run(args, cwd=root, log=log)
+            run(args, cwd=root, log=log, timeout=timeout)
             if family == "maven":
                 tree_file = target / "maven-dependency-tree.json"
 
@@ -249,7 +246,7 @@ def resolve_dependencies(project, builds, out, log, diagnostic):
                 tree_args = [*args[:-1], "accidionDependencyPaths"]
 
             try:
-                run(tree_args, cwd=root, log=log)
+                run(tree_args, cwd=root, log=log, timeout=timeout)
             except Exception as error:
                 diagnostic(f"{family} dependency paths unavailable ({type(error).__name__})")
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
@@ -512,9 +509,133 @@ def validate_report_directory(path, label):
             return
 
 
-def execute(options, system, arch):
+def safe_report_path(path, expected_type):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not expected_type(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise ValueError(f"Unsafe report path: {path}")
+    return info
+
+
+def protect_project_reports(project):
+    git = shutil.which("git")
+    if not git:
+        if any(os.path.lexists(parent / ".git") for parent in (project, *project.parents)):
+            raise ValueError("Git is required to protect project reports from accidental commits")
+        return
+
+    def git_call(*args, allowed=(0,), input=None):
+        result = subprocess.run([git, "-C", project, *args], input=input, capture_output=True)
+        if result.returncode not in allowed:
+            raise ValueError(result.stderr.decode(errors="replace").strip() or f"git {args[0]} failed")
+        return result
+
+    if git_call("rev-parse", "--is-inside-work-tree", allowed=(0, 128)).stdout.strip() != b"true":
+        if any(os.path.lexists(parent / ".git") for parent in (project, *project.parents)):
+            raise ValueError("Git could not verify the application worktree")
+        return
+    paths = [f"reports/{name}" for name in GENERATED_JSON]
+    pathspecs = [f":(icase,literal){path}" for path in paths]
+    if git_call("ls-files", "-z", "--", *pathspecs).stdout:
+        raise ValueError("A generated report path is tracked by Git. Remove it from the index before scanning")
+    prefix = git_call("rev-parse", "--show-prefix").stdout.removesuffix(b"\n").removesuffix(b"\r")
+    if b"\n" in prefix or b"\r" in prefix:
+        raise ValueError("Cannot write literal Git exclusions for an application path containing a line break")
+    exclude = project / os.fsdecode(git_call("rev-parse", "--git-path", "info/exclude")
+                                    .stdout.removesuffix(b"\n").removesuffix(b"\r"))
+    safe_report_path(exclude.parent, stat.S_ISDIR)
+    exclude.parent.mkdir(exist_ok=True)
+    info = safe_report_path(exclude, stat.S_ISREG)
+    if info and info.st_nlink != 1:
+        raise ValueError(f"Unsafe Git exclusion file: {exclude}")
+    rules = {path.encode(): path.encode() for path in paths}
+    rules[b"reports/.accidion-export-probe/report.json"] = b"reports/.accidion-export-*/"
+
+    def ignored_paths(paths):
+        result = git_call("check-ignore", "-z", "--stdin", allowed=(0, 1),
+                          input=b"".join(path + b"\0" for path in paths))
+        return set(result.stdout.split(b"\0"))
+
+    missing = rules.keys() - ignored_paths(rules)
+    if missing:
+        with exclude.open("a+b") as output:
+            output.seek(0)
+            existing = set(output.read().splitlines())
+            directory = re.sub(rb"([\\*?\[\] ])", rb"\\\1", prefix)
+            new_rules = [b"/" + directory + rules[path] for path in sorted(missing)]
+            lines = [rule for rule in new_rules if rule not in existing]
+            if lines:
+                output.write(b"\n" + b"\n".join(lines) + b"\n")
+        if not missing.issubset(ignored_paths(missing)):
+            raise ValueError("Git ignore rules override the local report exclusions")
+
+
+def prepare_project_reports(project, home, stack):
+    # Keep the kernel lock outside the worktree and release it even on scan errors.
+    key = hashlib.sha256(os.fsencode(os.path.normcase(project))).hexdigest()
+    locks = home / "report-locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    safe_report_path(locks, stat.S_ISDIR)
+    lock_path = locks / key
+    safe_report_path(lock_path, stat.S_ISREG)
+    lock = stack.enter_context(lock_path.open("ab"))
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise ValueError(f"Could not lock project reports for {project}: {error}") from error
+
+    destination = project / "reports"
+    safe_report_path(destination, stat.S_ISDIR)
+    if os.path.lexists(destination / ".git"):
+        raise ValueError(f"Project reports cannot be written to a separate Git repository: {destination}")
+    protect_project_reports(project)
+    destination.mkdir(exist_ok=True)
+    identity = safe_report_path(destination, stat.S_ISDIR)
+    outputs = [destination / name for name in GENERATED_JSON]
+    for output in outputs:
+        safe_report_path(output, stat.S_ISREG)
+    for output in reversed(outputs):
+        output.unlink(missing_ok=True)
+    return destination, identity
+
+
+def export_project_reports(destination, identity, report_dir, statuses):
+    current = safe_report_path(destination, stat.S_ISDIR)
+    if current is None or not os.path.samestat(identity, current):
+        raise ValueError(f"Project report directory changed during the scan: {destination}")
+    scanner_reports = [
+        Path(path).name
+        for entry in statuses.values() if entry["status"] == "success"
+        for path in (entry["report"], *entry.get("additionalReports", ())) if path
+    ]
+    # Stage every sanitized JSON file before publication and publish the summary last.
+    with tempfile.TemporaryDirectory(prefix=".accidion-export-", dir=destination) as directory:
+        staging = Path(directory)
+        names = [*scanner_reports, "security-summary.json"]
+        for name in names:
+            shutil.copyfile(report_dir / name, staging / name)
+        for name in names:
+            safe_report_path(destination / name, stat.S_ISREG)
+        for name in names:
+            (staging / name).replace(destination / name)
+
+
+def execute(options, system, arch, *, in_memory_preview=False):
+    with ExitStack() as stack:
+        return execute_with_reports(options, system, arch, stack, in_memory_preview=in_memory_preview)
+
+
+def execute_with_reports(options, system, arch, stack, *, in_memory_preview=False):
     os.umask(0o077)
-    for filename in TOOLKIT_FILES:
+    for filename in (() if in_memory_preview and options.dry_run else TOOLKIT_FILES):
         path = KIT / filename
         if not path.is_file() or not os.access(path, os.R_OK):
             raise ValueError(f"Required toolkit file is missing or unreadable: {path}. "
@@ -522,6 +643,20 @@ def execute(options, system, arch):
     project = options.project_path.resolve()
     if not project.is_dir():
         raise ValueError(f"Application path must be an accessible directory: {project}")
+    timeout = int(os.getenv("ACCIDION_SCAN_TIMEOUT", "3600"))
+    if timeout < 1:
+        raise ValueError("ACCIDION_SCAN_TIMEOUT must be a positive number of seconds")
+    nvd_mirror = os.getenv("ACCIDION_NVD_MIRROR")
+    if not nvd_mirror:
+        nvd_mirror = os.getenv("ACCIDION_NVD_DATAFEED_URL")
+        if nvd_mirror is None and not os.getenv("NVD_API_KEY"):
+            nvd_mirror = "https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/nvdcve-{0}.json.gz"
+    if nvd_mirror:
+        mirror = urlsplit(nvd_mirror)
+        if (mirror.scheme != "https" or not mirror.hostname or mirror.username is not None
+                or mirror.query or mirror.fragment or mirror.path.count("{0}") != 1
+                or any(character.isspace() for character in nvd_mirror)):
+            raise ValueError("The NVD feed requires an HTTPS URL template with exactly one {0} and no credentials")
     files = discover(project)
     roots = {family: build_roots(files, family) for family in ("maven", "gradle")}
     app_name = application_name(project, roots)
@@ -533,17 +668,34 @@ def execute(options, system, arch):
     image_requested = bool(options.image or options.build_image)
     java_app = bool(files["java"] or files["jars"] or files["maven"] or files["gradle"])
     java_needed = bool(files["jars"] or files["maven"] or files["gradle"])
+    package_app = java_app or any(files[technology] for technology in MANIFESTS.values())
+    scan_exclusions = []
+    launcher = os.environ.get("ACCIDION_STANDALONE_LAUNCHER")
+    toolkit = [KIT / name for name in (*TOOLKIT_FILES, "security-scan.sh", "python-bootstrap.sh",
+                                       "scripts/security-scan.template.sh")]
+    if launcher:
+        toolkit.append(Path(launcher).resolve())
+    for path in toolkit:
+        if path.is_relative_to(project):
+            scan_exclusions.append(path.relative_to(project))
+
     applicability = {
         "gitleaks": None,
-        "semgrep": None if java_app else "No Java application inputs",
+        "semgrep": None if java_app or files["sql"] else "No inputs for bundled Java and SQL rules",
         "dependency-check": None if java_needed else "No Maven/Gradle build files or Java archives",
-        "syft": None if java_app else "No Java application inputs",
-        "grype": None if java_app or options.image or options.build_image else "No Java SBOM or container target",
+        "syft": None if package_app else "No supported package manifests or Java inputs",
+        "grype": None if package_app or image_requested else "No supported package manifests or container target",
         "checkov": None if files["iac"] or files["dockerfiles"] else (
             "OpenTofu files found, but native .tofu/.tofu.json coverage is unavailable"
             if files["opentofu"] else "No supported infrastructure candidates"),
     }
     selected = set(getattr(options, "scanner", REPORTS))
+    required = os.getenv("ACCIDION_REQUIRED_SCANNERS")
+    policy = set(scanner_selection(required)) if required else set()
+    if policy and (options.setup_only or options.dry_run):
+        raise ValueError("Configured policy requires a full scan execution")
+    if not policy.issubset(selected):
+        raise ValueError("Scanner selection omits scanners required by ACCIDION_REQUIRED_SCANNERS")
     prerequisites = set()
 
     if image_requested and "grype" not in selected:
@@ -553,7 +705,7 @@ def execute(options, system, arch):
 
     scan_package_grype = (
         "grype" in selected
-        and java_app
+        and package_app
         and (not image_requested or complete_scan)
     )
 
@@ -601,6 +753,11 @@ def execute(options, system, arch):
                           "scanners": applicability}, indent=2))
         return 0
 
+    if not options.setup_only:
+        try:
+            destination, report_identity = prepare_project_reports(project, home, stack)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise ValueError(f"Project report export could not be prepared: {error}") from error
     report_dir = private_run_path(application_reports)
     total_started = time.perf_counter()
     started = datetime.now(timezone.utc)
@@ -659,8 +816,20 @@ def execute(options, system, arch):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         return path
 
-    with tempfile.TemporaryFile(mode="w+", dir=report_dir, encoding="utf-8", errors="replace") as log:
+    with (
+        tempfile.TemporaryDirectory(prefix="scanner-state-", dir=report_dir) as scanner_state,
+        tempfile.TemporaryFile(mode="w+", dir=report_dir, encoding="utf-8", errors="replace") as log,
+    ):
         installer = Installer(system, arch, cache, not options.no_install, log)
+        installer.scratch_env = {key: scanner_state for key in ("TMPDIR", "TEMP", "TMP")}
+        # Semgrep's Windows RPC transport uses the native temp path. Keep it short
+        # while placing Python's scratch directory and Semgrep state with the report.
+        installer.semgrep_env = {
+            "TMPDIR": scanner_state,
+            "SEMGREP_LOG_FILE": str(Path(scanner_state) / "semgrep.log"),
+            "SEMGREP_SETTINGS_FILE": str(Path(scanner_state) / "settings.yml"),
+            "SEMGREP_ENABLE_VERSION_CHECK": "0",
+        }
         installer.records["python"] = {
             "status": "installed" if os.getenv("ACCIDION_PYTHON_BOOTSTRAPPED") else "reused",
             "version": ".".join(map(str, sys.version_info[:3])),
@@ -696,6 +865,9 @@ def execute(options, system, arch):
                 tools[name] = None
             else:
                 tools[name] = installer.ensure(name)
+        for name, record in installer.records.items():
+            if record["status"] in {"unavailable", "installation_failed"}:
+                print(f"{name}: {record['reason']}", file=log)
         log.flush()
 
         def execute_scan(name, action, skip=None):
@@ -725,8 +897,9 @@ def execute(options, system, arch):
                 progress(label, "skipped", unit=unit, reason=skip)
                 return
             if not tools[name]:
-                entry.update(status="failed", reason=installation.get("reason"))
-                progress(label, "failed", unit=unit, reason="Tool unavailable; review installation in the report")
+                entry.update(status="unavailable", reason=installation.get("reason"))
+                progress(label, "unavailable", unit=unit, reason=redactor.text(entry["reason"]) if entry["reason"]
+                         else "Tool unavailable; review installation in the report")
                 return
             raw_output = work / REPORTS[name]
             problems = []
@@ -819,41 +992,52 @@ def execute(options, system, arch):
                     processing["totalSeconds"] = round(time.perf_counter() - processing_started, 3)
                     emit(f"{label} | Report processing took {processing['totalSeconds']:.3f}s")
             if entry["report"] or entry.get("additionalReports"):
-                entry["findingCount"] = len(entry["findings"])
-                if entry["nativeFindingCount"] != entry["findingCount"]:
+                observed = len(entry["findings"])
+                entry["findingCount"] = observed if not problems or observed else None
+                if entry["nativeFindingCount"] is not None and entry["nativeFindingCount"] != observed:
                     problems.append(f"Native findings ({entry['nativeFindingCount']}) differ from normalized "
-                                    f"findings ({entry['findingCount']}); inspect the individual report")
+                                    f"findings ({observed}); inspect the individual report")
+            if problems and entry["nativeFindingCount"] == 0:
+                entry["nativeFindingCount"] = None
+                entry["findingCount"] = None
             entry.update(status="failed" if problems else "success",
                          reason=redactor.text("; ".join(problems)) if problems else None)
             entry["completedAt"] = datetime.now(timezone.utc).isoformat()
             entry["durationSeconds"] = round(time.perf_counter() - scanner_started, 2)
             count = entry.get("inventoryCount") if name == "syft" else entry["findingCount"]
             progress(label, entry["status"], entry["durationSeconds"], count, unit,
-                     "Review scanner report and run.log" if problems else None)
+                     redactor.text(problems[0]) if problems else None)
+            if problems:
+                print(f"{label}: {entry['reason']}", file=log)
             log.flush()
 
         def invoke(cmd, *args, accepted=(0,), env=None):
             print(f"\n--- {Path(cmd[0]).name} ---", file=log, flush=True)
-            run([*cmd, *args], cwd=project, log=log, accepted=accepted, env=env)
+            scanner_env = {**os.environ, **(env if env is not None else installer.scratch_env)}
+            run([*cmd, *args], cwd=project, log=log, accepted=accepted, env=scanner_env, timeout=timeout)
 
         with tempfile.TemporaryDirectory(prefix="work-", dir=report_dir) as directory:
             work = Path(directory)
             deps = work / "dependencies"
             deps.mkdir()
             resolution_error = None
+            dependency_resolution_seconds = None
             resolved_dependencies = False
 
             def prepare_dependencies():
-                nonlocal resolution_error, resolved_dependencies, maven_index, maven_index_duration
+                nonlocal resolution_error, resolved_dependencies, maven_index, maven_index_duration, dependency_resolution_seconds
                 if resolved_dependencies:
                     return
                 resolved_dependencies = True
+                resolution_started = time.perf_counter()
                 try:
                     emit("Preparing Maven/Gradle dependencies...")
-                    resolve_dependencies(project, builds, deps, log, diagnostics.append)
+                    resolve_dependencies(project, builds, deps, log, diagnostics.append, timeout=timeout)
                     emit("Dependency resolution completed.")
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                     resolution_error = str(error)
+                finally:
+                    dependency_resolution_seconds = round(time.perf_counter() - resolution_started, 3)
 
                 tree_paths = sorted(deps.rglob("maven-dependency-tree.json"))
                 if tree_paths:
@@ -891,43 +1075,49 @@ def execute(options, system, arch):
                     raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
                 emit("OWASP Dependency-Check: preparing vulnerability database...")
                 database = vulnerability_cache("dependency-check", home / "dependency-check-data")
-                # A cold NVD REST API sync without a dedicated API key is frequently
-                # rate-limited (HTTP 429). Use OWASP's documented JSON 2.0 mirror.
-                # Organizations can supply an approved, centrally managed feed.
-                feed = os.environ.get(
-                    "ACCIDION_NVD_DATAFEED_URL",
-                    "https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/nvdcve-{0}.json.gz",
-                )
-                from urllib.parse import urlsplit
-                parsed_feed = urlsplit(feed)
-                if (parsed_feed.scheme != "https" or not parsed_feed.hostname
-                        or parsed_feed.username or parsed_feed.password
-                        or feed.count("{0}") != 1):
-                    raise ValueError(
-                        "ACCIDION_NVD_DATAFEED_URL must be an HTTPS NVD JSON 2.0 "
-                        "feed template containing exactly one {0} placeholder"
-                    )
-                diagnostics.append(
-                    "OWASP Dependency-Check uses a configured NVD JSON 2.0 "
-                    "feed; ensure its freshness and availability meet organizational policy"
-                )
                 args = ["--project", project.name, "--format", "JSON", "--out", out.parent,
-                        "--data", database, "--nvdDatafeed", feed, "--scan", deps]
+                        "--data", database, "--scan", deps,
+                        "--exclude", "**/maven-dependency-tree.json",
+                        "--exclude", "**/gradle-dependency-paths-*.json"]
                 for artifact in files["jars"]:
                     args.extend(("--scan", artifact))
+                if nvd_mirror:
+                    diagnostics.append("OWASP Dependency-Check uses a configured NVD JSON 2.0 feed")
+                    args.extend(("--nvdDatafeed", nvd_mirror))
+                if key := os.getenv("NVD_API_KEY"):
+                    if not re.fullmatch(r"[a-zA-Z0-9-]+", key):
+                        raise ValueError("NVD_API_KEY contains unexpected characters")
+                    redactor.add([key])
+                    properties = work / "dependency-check.properties"
+                    properties.write_text(f"nvd.api.key={key}\n", encoding="ascii")
+                    args.extend(("--propertyfile", properties))
                 emit("OWASP Dependency-Check: starting database update and dependency analysis...")
-                invoke(cmd, *args)
-                emit("OWASP Dependency-Check: execution completed.")
+                command_started = time.perf_counter()
+                if recover_dependency_check_lock(database):
+                    print("Dependency-Check | Removed an orphaned update lock before scanning", file=log)
+                try:
+                    invoke(cmd, *args)
+                except (CommandTimeout, KeyboardInterrupt):
+                    if recover_dependency_check_lock(database, wait_for_release=True):
+                        print("Dependency-Check | Removed an orphaned update lock after scanning", file=log)
+                    raise
+                finally:
+                    statuses["dependency-check"]["commandSeconds"] = round(time.perf_counter() - command_started, 3)
+
+            excludes = ["--exclude", "**/.git/**", "--exclude", "./reports/**"]
+            for filename in GENERATED_JSON:
+                excludes.extend(("--exclude", f"**/{filename}"))
+            for path in scan_exclusions:
+                excludes.extend(("--exclude", "./" + path.as_posix()))
 
             def syft(cmd, out):
                 # Inventory the resolved dependencies independently of the original project
                 # so package-manager dependencies and existing application artifacts are represented.
                 prepare_dependencies()
-                if resolution_error:
-                    raise RuntimeError(f"Dependency resolution failed: {resolution_error}")
-                excludes = [flag for file in GENERATED_JSON for flag in ("--exclude", f"**/{file}")]
-                invoke(cmd, "scan", f"dir:{project}", "--exclude", "**/.git/**", *excludes,
+                invoke(cmd, "scan", f"dir:{project}", *excludes,
                        "-o", f"cyclonedx-json={out}")
+                if resolution_error:
+                    raise RuntimeError(f"SBOM only covers files in the project; dependency resolution failed: {resolution_error}")
                 if not builds:
                     return
                 resolved = work / "resolved-sbom.json"
@@ -954,15 +1144,25 @@ def execute(options, system, arch):
                                           for ref, targets in references.items()]
                 write_json(out, report)
 
-            def run_grype(cmd, target, out):
+            def run_grype(cmd, target, out, *extra):
                 database = vulnerability_cache("grype", Path(os.environ.get("GRYPE_DB_CACHE_DIR") or home / "grype-db"))
-                invoke(cmd, target, "-o", "json", "--file", out,
-                       env={**os.environ, "GRYPE_DB_CACHE_DIR": str(database)})
+                # SQLite hydration can require gigabytes of temporary space. Use the
+                # cache filesystem so a small report or system temp filesystem is irrelevant.
+                with tempfile.TemporaryDirectory(prefix="grype-scratch-", dir=database) as scratch:
+                    env = dict.fromkeys(("TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR"), scratch)
+                    invoke(cmd, target, "-o", "json", "--file", out, *extra,
+                           env={**env, "GRYPE_DB_CACHE_DIR": str(database)})
 
             def grype_sbom(cmd, out):
-                if statuses["syft"]["status"] != "success":
-                    raise RuntimeError("A successful Syft SBOM is required for package scanning")
-                run_grype(cmd, f"sbom:{work / REPORTS['syft']}", out)
+                syft_status = statuses["syft"]
+                if syft_status["status"] == "success" and syft_status.get("inventoryCount") is not None:
+                    run_grype(cmd, f"sbom:{work / REPORTS['syft']}", out)
+                    return
+                statuses["grype"]["packageScanMode"] = "direct-directory"
+                run_grype(cmd, f"dir:{project}", out, *excludes)
+                if builds:
+                    raise RuntimeError("Grype directory scan completed with partial Java coverage. "
+                                       "A complete Syft SBOM is required for resolved build dependencies.")
 
             def grype_image(cmd, out):
                 if not docker:
@@ -1011,13 +1211,28 @@ def execute(options, system, arch):
                         shutil.move(raw, out)
 
             setup = "Setup-only mode" if options.setup_only else None
-            execute_scan("gitleaks", lambda cmd, out: invoke(
-                cmd, "dir", project, "--config", KIT / ".gitleaks.toml",
-                "--report-format", "json", "--report-path", out, "--redact=0", "--exit-code", "0"), setup)
+            def gitleaks(cmd, out):
+                config = KIT / ".gitleaks.toml"
+                if scan_exclusions or not options.setup_only:
+                    # Match both native Windows separators and portable relative paths.
+                    patterns = [r"(?:^|[\\/])" + r"[\\/]".join(map(re.escape, path.parts)) + "$"
+                                for path in scan_exclusions]
+                    patterns.append(r"(?:^|[\\/])reports[\\/]")
+                    content = config.read_text(encoding="utf-8")
+                    content = content.replace("paths = [", "paths = [" + ", ".join(
+                        json.dumps(pattern, ensure_ascii=False) for pattern in patterns) + ", ", 1)
+                    config = work / ".gitleaks.toml"
+                    config.write_text(content, encoding="utf-8")
+                invoke(cmd, "dir", project, "--config", config, "--report-format", "json",
+                       "--report-path", out, "--redact=0", "--exit-code", "0")
+
+            execute_scan("gitleaks", gitleaks, setup)
             execute_scan("semgrep", lambda cmd, out: invoke(
                 cmd, "scan", "--config", KIT / "semgrep.yml", "--metrics=off", "--disable-version-check",
+                "--exclude=/reports/",
                 *(f"--exclude={filename}" for filename in GENERATED_JSON),
-                "--json", "--output", out, project), setup or applicability["semgrep"])
+                *(f"--exclude=/{path.as_posix()}" for path in scan_exclusions),
+                "--json", "--output", out, project, env=installer.semgrep_env), setup or applicability["semgrep"])
             execute_scan("dependency-check", dependency_check, setup or applicability["dependency-check"])
             execute_scan("syft", syft, setup or applicability["syft"])
             execute_scan("grype", grype, setup or applicability["grype"])
@@ -1050,11 +1265,20 @@ def execute(options, system, arch):
                "mavenIndexDurationSeconds": maven_index_duration,
                "toolVersions": {name: entry.get("version") for name, entry in installer.records.items()},
                "totalFindings": len(issues), "findingsBySeverity": dict(Counter(x["severity"] for x in issues)),
-               "findingsByScanner": {name: len(entry["findings"]) for name, entry in statuses.items()},
+               "requiredScanners": sorted(policy),
+               "dependencyResolutionSeconds": dependency_resolution_seconds,
+               "findingsByScanner": {name: entry["findingCount"] for name, entry in statuses.items()},
                "sbomComponentCount": statuses["syft"].get("inventoryCount"), "issues": issues,
                "log": str(report_dir / "run.log")}
     summary["totalDurationSeconds"] = round(time.perf_counter() - total_started, 2)
     write_json(report_dir / "security-summary.json", redactor.data(summary))
+    export_failed = False
+    if not options.setup_only:
+        try:
+            export_project_reports(destination, report_identity, report_dir, statuses)
+        except (OSError, ValueError) as error:
+            print(f"Project report export failed: {error}. Private reports: {report_dir}", file=sys.stderr)
+            export_failed = True
     failures = {"unavailable", "installation_failed"}
     required = provision_scanners if options.setup_only else {
         name for name, entry in statuses.items() if entry["status"] != "skipped"
@@ -1062,6 +1286,11 @@ def execute(options, system, arch):
     failed = (any(record["status"] in failures for name, record in installer.records.items()
                    if name in required or name not in REPORTS)
               or any(entry["status"] == "failed" for entry in statuses.values()))
+    if not options.setup_only:
+        unmet = sorted(name for name in policy if statuses[name]["status"] != "success")
+        if unmet:
+            emit("Required scanners did not complete successfully: " + ", ".join(unmet))
+            failed = True
     inventory = None
     if sbom_path := statuses["syft"]["report"]:
         try:
@@ -1075,7 +1304,7 @@ def execute(options, system, arch):
     emit("\n=== Security Summary ===")
     emit(f"Scanner execution: {'failed' if failed else 'completed'} ({summary['totalDurationSeconds']:.2f}s)")
     executions = Counter(entry["status"] for entry in statuses.values())
-    emit("Scanner status: " + " | ".join(f"{executions[state]} {state}" for state in ("success", "failed", "skipped")))
+    emit("Scanner status: " + " | ".join(f"{executions[state]} {state}" for state in ("success", "failed", "skipped", "unavailable")))
     validation = "findings require review" if issues else "no findings reported by completed scans"
     if options.setup_only:
         validation = "not run (setup only)"
@@ -1104,21 +1333,18 @@ def execute(options, system, arch):
     filenames = sorted(path.name for path in report_dir.glob("*.json"))
     emit("  JSON reports: " + ", ".join(filenames))
     emit("  Log: run.log")
-    if not options.setup_only:
-        try:
-            exported = export_project_reports(project, report_dir)
-            emit(f"Project JSON reports: {exported}")
-        except (OSError, ValueError) as error:
-            emit(f"Project report export failed: {error}. Private reports are retained.")
-            return 1
+    if not options.setup_only and not export_failed:
+        emit(f"Application JSON reports: {destination}")
+    if export_failed:
+        return 2
     return int(failed)
 
 
-def main():
+def main(*, in_memory_preview=False):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
     try:
-        return execute(args_for(), *detect())
+        return execute(args_for(), *detect(), in_memory_preview=in_memory_preview)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"Starter kit failed: {error}", file=sys.stderr)
         return 2

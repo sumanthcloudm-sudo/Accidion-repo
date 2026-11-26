@@ -1274,10 +1274,10 @@ def terminal_summary(issues, metadata, project, contexts, emit, *,
         grouped = sum(scanner_counts.values())
         grouped_total += grouped
         native = entry["nativeFindingCount"] if entry is not None else len(rows)
-        raw = native if native is not None else ("Unavailable" if entry["status"] == "failed" else 0)
-        terminal_field(emit, "Raw findings", raw)
-        terminal_field(emit, "Grouped findings", grouped)
-        terminal_field(emit, "Issues to review", len(groups))
+        terminal_field(emit, "Raw findings", native if native is not None else "Unavailable")
+        if native is not None or groups:
+            terminal_field(emit, "Grouped findings", grouped)
+            terminal_field(emit, "Issues to review", len(groups))
         for number, (package, findings) in enumerate(groups, 1):
             terminal_issue(number, label, package, findings, project, contexts, emit, details, evidence_by_issue,
                            declaration_lookup)

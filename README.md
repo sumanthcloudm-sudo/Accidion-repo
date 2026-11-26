@@ -38,12 +38,11 @@ Complete native Linux and macOS end-to-end validation remains pending.
 - Java JDK, Maven or Gradle when required by the application
 - Docker installed and running for Docker image scanning
 
-### Clone the Repository
+### Get the Standalone Script
 
-```bash
-git clone https://github.com/sumanthcloudm-sudo/Accidion-repo.git
-cd Accidion-repo
-```
+Download [security-scan.sh](https://raw.githubusercontent.com/sumanthcloudm-sudo/Accidion-repo/main/security-scan.sh)
+and save it in the application root. Open Bash there. The script includes
+the Python sources and scanner configuration it needs.
 
 Specify your application directory when scanning an external project:
 
@@ -56,7 +55,7 @@ Without a configured application path, the current working directory is scanned.
 ### Complete Security Scan
 
 ```bash
-bash security-scan.sh --scanner all
+bash security-scan.sh
 ```
 
 All applicable security scanners are executed.
@@ -154,11 +153,11 @@ The launcher automatically:
 
 ## Configuration (Optional)
 
-Developers can save reusable preferences in
-`security-scan.properties`.
+The first regular run creates `security-scan.properties` if it is missing.
+Edit it to save reusable preferences.
 
 ```properties
-PROJECT_ROOT=
+PROJECT_ROOT=.
 OUTPUT_DIR=
 SCANNERS=all
 DOCKER_IMAGE=
@@ -175,17 +174,15 @@ BUILD_IMAGE=false
 
 Configuration changes are not required when using command-line arguments.
 
-Report directories are created automatically and must be outside
+The private report directory is created automatically and must be outside
 the application directory.
 
 ## Security Reports
 
-After a scan, sanitized JSON reports are also exported automatically to
-`<application>/reports/<scan-directory>/` for viewing in IntelliJ IDEA.
-Each run uses a separate folder; private history and logs remain in the
-configured private report directory. Keep exported security findings private.
-No manual copying is required. Setup-only and dry-run do not export reports.
-
+After a scan, open `reports/security-summary.json` in the application.
+Sanitized JSON from successful scanner stages is exported alongside it.
+Private history and logs stay in the configured private report directory.
+Setup-only and dry-run do not export reports.
 
 Reports are generated in the configured output directory
 or the default location:
@@ -213,3 +210,5 @@ and address identified security issues.
 
 Refer to the [DevOps Security Scanning Guide](Devops%20Security%20Scanning.md)
 for detailed execution steps, configuration and report interpretation.
+
+See the [Developer Guide](DEVELOPER-GUIDE.md) for Ubuntu usage and standalone build validation.

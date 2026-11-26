@@ -5,11 +5,14 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -20,10 +23,41 @@ RELEASES = {
     "grype": ("anchore/grype", "0.121.3"),
     "dependency-check": ("dependency-check/DependencyCheck", "12.2.2"),
 }
+# SHA-256 digests published with the pinned GitHub release assets.
+RELEASE_SHA256 = {
+    "gitleaks_8.30.1_darwin_arm64.tar.gz": "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
+    "gitleaks_8.30.1_darwin_x64.tar.gz": "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
+    "gitleaks_8.30.1_linux_arm64.tar.gz": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+    "gitleaks_8.30.1_linux_x64.tar.gz": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+    "gitleaks_8.30.1_windows_arm64.zip": "b95f5e4f5c425cedca7ee203d9afd29597e692c4924a12ed42f970537c72cc0f",
+    "gitleaks_8.30.1_windows_x64.zip": "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e",
+    "syft_1.57.1_darwin_amd64.tar.gz": "2355758c1142982a67b309604c5d75effdbe638a57c771979ea8fd1a16656abc",
+    "syft_1.57.1_darwin_arm64.tar.gz": "e0a74a5d2688d1254b4e17b71f068a83215e3625f846265bf6614c7ba06f3a96",
+    "syft_1.57.1_linux_amd64.tar.gz": "bf52519eb57f675d47c07d43213cb6dff6449f3d6d1147ff6701ed91f44eef0c",
+    "syft_1.57.1_linux_arm64.tar.gz": "aa3d3e07344f590bcce8d31043b752daa76c8a56c2aa34ceeee63c6168152582",
+    "syft_1.57.1_windows_amd64.zip": "3a01fe865076bb548352195b77e88fa4649277861ea458efe165c3a810b6dcc7",
+    "syft_1.57.1_windows_arm64.zip": "8cdd580b5f7160d12b66c7c5191100a6cf792e130d8a28deeae5ea45e0030e00",
+    "grype_0.121.3_darwin_amd64.tar.gz": "65bfb1b3b30d32e9dab156a60003c7146e619f649992be227bf09c9ccbf44f7e",
+    "grype_0.121.3_darwin_arm64.tar.gz": "54336f2cd8cdee8b3d8ea83462561ff7fa9293498054c7c53a193db44bfea4c8",
+    "grype_0.121.3_linux_amd64.tar.gz": "e9da18cc1429e786722e32161288103600efffd8e483c90761f90485bd1bec85",
+    "grype_0.121.3_linux_arm64.tar.gz": "b7815598d48da78bfd16f5b98ef28e1bb09c03d34fc8c3e350f99b6ccb3c7cba",
+    "grype_0.121.3_windows_amd64.zip": "3007a5afea25c60030a49d6c24d4e5abb6c94c0dbeed7ea303eb26df8e900c18",
+    "dependency-check-12.2.2-release.zip": "bf07fefd81af3094c5f6850423b014df44db62ce2dbad0f79079a90df675e44a",
+}
 PYPI = {"semgrep": "1.186.0", "checkov": "3.2.495"}
+# The 1.182 series was the last to ship Intel macOS wheels.
+SEMGREP_INTEL_MACOS = "1.182.1"
+SEMGREP_INTEL_WHEEL = (
+    "https://files.pythonhosted.org/packages/37/7e/"
+    "20dafdcb0a7d11d6a5017601a3737ea3b4bea5628711db7fddde3f5ff3de/"
+    "semgrep-1.182.1-cp310.cp311.cp312.cp313.cp314.py310.py311.py312.py313.py314-none-macosx_10_14_x86_64.whl"
+    "#sha256=1db6d5becbb60d697a312fce6ec7e00cfde4eff1d221cce7ce85c49df55240eb"
+)
+LINUX_JDK = "21.0.11+10"
+BOOTSTRAP_PIP = "25.3"
 MINIMUM = {
     "git": (2, 30), "java": (11,), "mvn": (3, 6), "gradle": (7,),
-    "docker": (20, 10), "gitleaks": (8, 19), "syft": (1, 57),
+    "docker": (20, 10), "gitleaks": (8, 19), "syft": (1, 55),
     "grype": (0, 121), "semgrep": (1, 150), "checkov": (3, 2),
     "dependency-check": (12, 1),
 }
@@ -52,6 +86,10 @@ def release_asset(name, version, system, arch):
     return f"{name}_{version}_{os_name}_{arch}.{extension}"
 
 
+class CommandTimeout(RuntimeError):
+    pass
+
+
 def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,), env=None):
     args = [str(arg) for arg in args]
     if os.name == "nt":
@@ -61,64 +99,175 @@ def run(args, *, cwd=None, capture=False, log=None, timeout=3600, accepted=(0,),
                 raise RuntimeError("A Windows batch argument contains an unsafe shell character")
             quoted = " ".join(f'"{arg}"' for arg in args)
             args = f'"{os.environ["COMSPEC"]}" /d /v:off /s /c "{quoted}"'
-    import threading
-
     finished = threading.Event()
-    started = time.monotonic()
 
     def heartbeat():
+        started = time.monotonic()
         while not finished.wait(30):
             elapsed = int(time.monotonic() - started)
-            print(
-                f"  Operation still running | Elapsed: {elapsed}s",
-                file=sys.stderr,
-                flush=True,
-            )
+            print(f"  Operation still running | Elapsed: {elapsed}s", file=sys.stderr, flush=True)
 
     worker = None
     if not capture and log is not None:
         worker = threading.Thread(target=heartbeat, daemon=True)
         worker.start()
-
     try:
-        result = subprocess.run(
+        with subprocess.Popen(
             args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
-            stdout=subprocess.PIPE if capture else log,
-            stderr=subprocess.STDOUT,
-            timeout=timeout, encoding="utf-8", errors="replace",
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"Command exceeded the {timeout}-second timeout. "
-            "Review connectivity, build configuration and scanner diagnostics."
-        ) from None
+            stdout=subprocess.PIPE if capture else log, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace", start_new_session=os.name != "nt",
+        ) as process:
+            job = windows_process_job(process) if os.name == "nt" else None
+            try:
+                output, _ = process.communicate(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+                stop_process_tree(process, job)
+                process.communicate()
+                if isinstance(error, KeyboardInterrupt):
+                    raise
+                raise CommandTimeout(f"Command exceeded the {timeout}-second timeout") from error
+            finally:
+                if job:
+                    kernel, handle = job
+                    kernel.CloseHandle(handle)
+            if process.returncode not in accepted:
+                if capture and log is not None:
+                    print(output, file=log, flush=True)
+                raise RuntimeError(f"Command exited with status {process.returncode}")
+        return output or ""
     finally:
         finished.set()
         if worker is not None:
             worker.join()
-    if result.returncode not in accepted:
-        if capture and log is not None and result.stdout:
-            log.write(result.stdout + "\n")
-            log.flush()
-        raise RuntimeError(f"Command exited with status {result.returncode}")
-    return result.stdout or ""
+
+
+def windows_process_job(process):
+    # Group Windows batch launchers with their child scanner processes.
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.CreateJobObjectW(None, None)
+    if handle:
+        if kernel.AssignProcessToJobObject(handle, process._handle):
+            return kernel, handle
+        kernel.CloseHandle(handle)
+    return None
+
+
+def stop_process_tree(process, job):
+    if job:
+        kernel, handle = job
+        if kernel.TerminateJobObject(handle, 1):
+            return
+    if os.name == "nt":
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        try:
+            subprocess.run(
+                [system / "taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if process.poll() is None:
+            process.kill()
+    else:
+        try:
+            # Give scanner shutdown hooks a chance to release database locks.
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=3)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def recover_dependency_check_lock(database, *, wait_for_release=False):
+    if os.name != "nt":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                               ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                  ctypes.c_void_p, wintypes.DWORD]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    read_and_delete = 0x80000000 | 0x00010000
+    open_existing, open_reparse_point = 3, 0x00200000
+    path = str(database / "odc.update.lock")
+    # Dependency-Check holds a file handle for the lifetime of its update lock.
+    # Open with no sharing and delete by handle to avoid a check/unlink race.
+    invalid_handle = ctypes.c_void_p(-1).value
+    sharing_violation = 32
+    deadline = time.monotonic() + (2 if wait_for_release else 0)
+    while True:
+        handle = kernel.CreateFileW(path, read_and_delete, 0, None, open_existing, open_reparse_point, None)
+        if handle != invalid_handle:
+            break
+        if ctypes.get_last_error() != sharing_violation or time.monotonic() >= deadline:
+            return False
+        # Windows may still be releasing the Java process's handles after termination.
+        time.sleep(0.05)
+    try:
+        marker = ctypes.create_string_buffer(33)
+        count = wintypes.DWORD()
+        if not kernel.ReadFile(handle, marker, len(marker), ctypes.byref(count), None):
+            return False
+        # Dependency-Check writes the marker only after taking the native lock.
+        # An empty file may belong to a process that is still acquiring it.
+        if not re.fullmatch(rb"[0-9a-fA-F]{32}", marker.raw[:count.value]):
+            return False
+        disposition = ctypes.c_ubyte(1)
+        file_disposition_info = 4
+        return bool(kernel.SetFileInformationByHandle(
+            handle, file_disposition_info, ctypes.byref(disposition), ctypes.sizeof(disposition)
+        ))
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def fetch(url, output=None, algorithm="sha256"):
-    headers = {"User-Agent": "accidion-starter-kit"}
-    # Use the CI token only for GitHub release metadata, never package downloads.
-    if url.startswith("https://api.github.com/repos/") and os.environ.get("GITHUB_TOKEN"):
-        headers["Authorization"] = "Bearer " + os.environ["GITHUB_TOKEN"]
-    request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=60) as response:
-        if output is None:
-            return response.read(4 * 1024 * 1024 + 1)
-        digest = hashlib.new(algorithm)
-        with output.open("wb") as target:
-            for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                digest.update(chunk)
-                target.write(chunk)
-        return digest.hexdigest()
+    if not url.startswith("https://"):
+        raise ValueError("Tool downloads require HTTPS")
+    request = urllib.request.Request(url, headers={"User-Agent": "accidion-starter-kit"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if not response.geturl().startswith("https://"):
+                    raise ValueError("Tool download redirected to a non-HTTPS URL")
+                if output is None:
+                    content = response.read(4 * 1024 * 1024 + 1)
+                    if len(content) > 4 * 1024 * 1024:
+                        raise ValueError("Release metadata exceeds the download limit")
+                    return content
+                digest = hashlib.new(algorithm)
+                with output.open("wb") as target:
+                    for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        target.write(chunk)
+                return digest.hexdigest()
+        except urllib.error.HTTPError as error:
+            if error.code not in {408, 500, 502, 503, 504} or attempt == 2:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            cause = getattr(error, "reason", error)
+            if not isinstance(cause, (TimeoutError, ConnectionError)) or attempt == 2:
+                raise
+        time.sleep(2 ** attempt)
 
 
 def unpack(archive, destination):
@@ -218,36 +367,45 @@ class Installer:
     def __init__(self, system, arch, cache, allow, log):
         self.system, self.arch, self.cache, self.allow, self.log = system, arch, cache, allow, log
         self.records = {}
+        self.scratch_env = {}
+        self.semgrep_env = {}
 
     def version(self, name, cmd, cwd=None):
         flag = {"gitleaks": "version", "syft": "version", "grype": "version"}.get(name, "--version")
         if name == "java":
             flag = "-version"
             java = Path(shutil.which(str(cmd[0])) or cmd[0]).resolve()
+            if self.system == "macos" and java == Path("/usr/bin/java"):
+                java_home = Path(run(["/usr/libexec/java_home"], capture=True, timeout=30).strip())
+                java = java_home / "bin/java"
+                cmd[0] = str(java)
             javac = java.with_name("javac.exe" if os.name == "nt" else "javac")
             if not javac.exists():
                 raise RuntimeError("A JDK with javac is required")
             run([javac, "-version"], capture=True, timeout=30)
-        output = run([*cmd, flag], cwd=cwd, capture=True, log=self.log, timeout=180)
-        match = re.search(r"\b(\d+\.\d+(?:\.\d+)?)\b", output)
+        if self.log is not None:
+            print(f"\n--- {name} version check ---", file=self.log, flush=True)
+        tool_env = self.semgrep_env if name == "semgrep" else self.scratch_env
+        env = {**os.environ, **tool_env} if tool_env else None
+        output = run([*cmd, flag], cwd=cwd, capture=True, log=self.log, timeout=180, env=env)
+        pattern = (r"(?mi)^Version:\s*(\d+\.\d+(?:\.\d+)?)"
+                   if name in {"syft", "grype"} and "Version:" in output
+                   else r"\b(\d+\.\d+(?:\.\d+)?)\b")
+        match = re.search(pattern, output)
         if not match or tuple(map(int, match[1].split("."))) < MINIMUM[name]:
             raise RuntimeError("Version is missing or below the supported minimum")
         if name == "java":
             java_home = java.parent.parent
-            if self.system == "macos" and java == Path("/usr/bin/java"):
-                java_home = Path(run(["/usr/libexec/java_home"], capture=True, timeout=30).strip())
-                if not (java_home / "bin/javac").is_file():
-                    raise RuntimeError("macOS Java shim did not resolve to a JDK")
             os.environ["JAVA_HOME"] = str(java_home)
             os.environ["PATH"] = f"{java.parent}{os.pathsep}{os.environ['PATH']}"
         return match[1]
 
     def ensure(self, name, wrapper=None, cwd=None):
-        import time
         from datetime import datetime, timezone
         ensure_started = time.perf_counter()
         ensure_started_at = datetime.now(timezone.utc).isoformat()
         status = "unavailable"
+        probe_error = None
         try:
             existing = shutil.which(name)
             java_home = os.environ.get("JAVA_HOME") if name == "java" else None
@@ -256,20 +414,42 @@ class Installer:
                           [existing] if existing else None, self.managed(name)]
             if name == "java" and self.system == "linux":
                 candidates.extend([str(p)] for p in sorted(Path("/usr/lib/jvm").glob("*/bin/java")) if p.is_file())
+            if name == "semgrep" and self.system == "windows":
+                candidates = [candidate for cmd in filter(None, candidates)
+                              for candidate in (cmd, [*cmd, "--legacy"])]
+            if name == "checkov" and self.system == "windows":
+                if existing:
+                    scripts = Path(existing).parent
+                    for python in (scripts / "python.exe", scripts.parent / "python.exe"):
+                        if python.is_file():
+                            candidates.append([python, "-I", "-m", "checkov.main"])
+                candidates.append([sys.executable, "-I", "-m", "checkov.main"])
             for cmd in filter(None, candidates):
                 try:
                     version = self.version(name, cmd, cwd)
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                    print(f"{name} candidate validation failed ({type(error).__name__}): {error}",
-                          file=self.log, flush=True)
+                    probe_error = error
+                    if self.log is not None:
+                        print(f"{name} version check failed: {error}", file=self.log, flush=True)
                     continue
                 self.records[name] = {"status": "reused", "version": version}
                 return cmd
             if not self.allow:
-                raise RuntimeError("Missing or incompatible; installation disabled")
+                detail = f" Last version check: {probe_error}" if probe_error else ""
+                raise RuntimeError(f"Missing or incompatible; installation disabled.{detail}")
+            if name == "semgrep" and (self.system, self.arch) == ("windows", "arm64"):
+                raise RuntimeError(f"Semgrep {PYPI[name]} publishes no native wheel for "
+                                   f"{self.system}/{self.arch}; use an approved compatible installation")
             status = "installation_failed"
             cmd = self.install(name)
-            self.records[name] = {"status": "installed", "version": self.version(name, cmd, cwd)}
+            try:
+                version = self.version(name, cmd, cwd)
+            except RuntimeError:
+                if name != "semgrep" or self.system != "windows":
+                    raise
+                cmd = [*cmd, "--legacy"]
+                version = self.version(name, cmd, cwd)
+            self.records[name] = {"status": "installed", "version": version}
             return cmd
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             self.records[name] = {"status": status, "reason": str(error)}
@@ -280,23 +460,28 @@ class Installer:
                 self.records[name]["completedAt"] = datetime.now(timezone.utc).isoformat()
                 self.records[name]["durationSeconds"] = round(time.perf_counter() - ensure_started, 2)
 
-    def pypi_version(self, name):
-        # 1.182 is the final upstream native Intel macOS release.
-        if name == "semgrep" and self.system == "macos" and self.arch == "amd64":
-            return "1.182.0"
-        return PYPI[name]
+    def pypi_package(self, name):
+        if name == "semgrep" and (self.system, self.arch) == ("macos", "amd64"):
+            return SEMGREP_INTEL_MACOS, SEMGREP_INTEL_WHEEL
+        version = PYPI[name]
+        return version, f"{name}=={version}"
 
     def managed(self, name):
         suffix = ".exe" if self.system == "windows" else ""
         if name in PYPI:
-            base = self.cache / f"{name}-{self.pypi_version(name)}-{sys.version_info.major}.{sys.version_info.minor}"
+            version, _ = self.pypi_package(name)
+            base = self.cache / f"{name}-{version}-{sys.version_info.major}.{sys.version_info.minor}"
             path = base / ("Scripts" if suffix else "bin") / (name + suffix)
             if name == "checkov" and suffix and not path.is_file():
                 interpreter = base / "Scripts/python.exe"
                 if interpreter.is_file():
-                    return [str(interpreter), "-c", "from checkov.main import Checkov; raise SystemExit(Checkov().run())"]
+                    return [str(interpreter), "-I", "-c", "from checkov.main import Checkov; raise SystemExit(Checkov().run())"]
+            if name == "checkov" and not suffix:
+                interpreter = base / "bin/python"
+                if interpreter.is_file() and path.is_file():
+                    return [str(interpreter), "-I", str(path)]
         elif name == "java" and self.system == "linux":
-            base = self.cache / f"java-21.0.11+10-{self.system}-{self.arch}"
+            base = self.cache / f"{name}-{LINUX_JDK}-{self.system}-{self.arch}"
             if not (base / ".complete").is_file():
                 return None
             path = next(base.glob("*/bin/java"), base / "missing")
@@ -321,10 +506,7 @@ class Installer:
         if name in PYPI:
             self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.install_pypi(name)
-        elif name == "java" and self.system == "linux":
-            self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.install_archive(name)
-        elif name in RELEASES or name in {"mvn", "gradle"}:
+        elif name in RELEASES or name in {"mvn", "gradle"} or (name == "java" and self.system == "linux"):
             self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.install_archive(name)
         else:
@@ -343,50 +525,73 @@ class Installer:
         return cmd
 
     def install_pypi(self, name):
-        base = self.cache / f"{name}-{self.pypi_version(name)}-{sys.version_info.major}.{sys.version_info.minor}"
-        created = not base.exists()
+        version, package = self.pypi_package(name)
+        base = self.cache / f"{name}-{version}-{sys.version_info.major}.{sys.version_info.minor}"
         if base.is_symlink():
             raise RuntimeError("Refusing to modify a symlinked scanner cache")
-        try:
-            run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
-        except RuntimeError:
-            if self.system != "linux":
-                raise
-            run(package_command(self.system, "pip"), log=self.log)
-            run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
         python = base / ("Scripts/python.exe" if self.system == "windows" else "bin/python")
-        pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
-        self.records[f"pip:{name}"] = {"status": "installed" if created else "reused", "version": pip.split()[1]}
+        try:
+            pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
+        except (OSError, RuntimeError):
+            try:
+                run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
+            except RuntimeError:
+                if self.system != "linux":
+                    raise
+                if linux_family() == "debian":
+                    # Debian can ship the system interpreter without ensurepip.
+                    run([sys.executable, "-m", "venv", "--clear", "--without-pip", base], log=self.log)
+                    self.bootstrap_pip(python)
+                else:
+                    run(package_command(self.system, "pip"), log=self.log)
+                    run([sys.executable, "-m", "venv", "--clear", base], log=self.log)
+            pip = run([python, "-m", "pip", "--version"], capture=True, log=self.log, timeout=60)
+            status = "installed"
+        else:
+            status = "reused"
+        self.records[f"pip:{name}"] = {"status": status, "version": pip.split()[1]}
         try:
             run([python, "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
-                 "--retries", "2", f"{name}=={self.pypi_version(name)}"], log=self.log)
+                 "--retries", "2", package], log=self.log)
         except RuntimeError as error:
-            raise RuntimeError(f"Could not install {name} {self.pypi_version(name)} wheels for {self.system}/{self.arch} "
+            raise RuntimeError(f"Could not install {name} {version} wheels for {self.system}/{self.arch} "
                                f"with Python {sys.version_info.major}.{sys.version_info.minor}. "
                                "Check wheel availability and the approved package index in run.log.") from error
 
+    def bootstrap_pip(self, python):
+        filename = f"pip-{BOOTSTRAP_PIP}-py3-none-any.whl"
+        release = json.loads(fetch(f"https://pypi.org/pypi/pip/{BOOTSTRAP_PIP}/json"))
+        wheel = next((item for item in release.get("urls", []) if item["filename"] == filename), None)
+        if not wheel or not wheel["url"].startswith("https://files.pythonhosted.org/"):
+            raise RuntimeError(f"PyPI did not publish the expected pip wheel ({filename})")
+        with tempfile.TemporaryDirectory(dir=self.cache) as temporary:
+            archive = Path(temporary) / filename
+            if fetch(wheel["url"], archive) != wheel["digests"]["sha256"]:
+                raise RuntimeError("Download checksum mismatch for pip")
+            launch = "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__')"
+            run([python, "-I", "-c", launch, archive, "--disable-pip-version-check", "install",
+                 "--no-index", "--no-deps", archive], log=self.log, timeout=120)
+
     def install_archive(self, name):
-        version = "21.0.11+10" if name == "java" else self.release_version(name)
+        version = LINUX_JDK if name == "java" else self.release_version(name)
         if name == "java":
             arch = {"amd64": "x64", "arm64": "aarch64"}[self.arch]
-            asset_name = f"OpenJDK21U-jdk_{arch}_linux_hotspot_21.0.11_10.tar.gz"
-            url = f"https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/{asset_name}"
+            asset = f"OpenJDK21U-jdk_{arch}_linux_hotspot_{version.replace('+', '_')}.tar.gz"
+            url = f"https://github.com/adoptium/temurin21-binaries/releases/download/jdk-{version.replace('+', '%2B')}/{asset}"
             algorithm = "sha256"
-            expected = fetch(url + ".sha256.txt").decode("ascii").split()[0]
-            if not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            checksum = fetch(url + ".sha256.txt").decode("ascii").split()
+            if not checksum or not re.fullmatch(r"[0-9a-fA-F]{64}", checksum[0]):
                 raise RuntimeError("Invalid JDK checksum")
+            expected = checksum[0]
         elif name in RELEASES:
             repo, _ = RELEASES[name]
             asset_name = release_asset(name, version, self.system, self.arch)
-            release = json.loads(fetch(f"https://api.github.com/repos/{repo}/releases/tags/v{version}"))
-            asset = next((item for item in release["assets"] if item["name"] == asset_name), None)
-            if not asset:
-                raise RuntimeError(f"No upstream {name} {version} package for {self.system}/{self.arch} "
+            expected = RELEASE_SHA256.get(asset_name)
+            if not expected:
+                raise RuntimeError(f"No verified upstream {name} {version} package for {self.system}/{self.arch} "
                                    f"({asset_name}); install a compatible approved binary if available")
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", asset.get("digest") or ""):
-                raise RuntimeError(f"No SHA-256 published for {asset_name}")
             url = f"https://github.com/{repo}/releases/download/v{version}/{asset_name}"
-            algorithm, expected = asset["digest"].split(":")
+            algorithm = "sha256"
         else:
             if name == "mvn":
                 url = f"https://archive.apache.org/dist/maven/maven-3/{version}/binaries/apache-maven-{version}-bin.zip"

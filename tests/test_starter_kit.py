@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -35,19 +36,22 @@ class StarterKitTests(unittest.TestCase):
     def test_project_report_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            project = root / "application"
-            project.mkdir()
+            destination = root / "application" / "reports"
+            destination.mkdir(parents=True)
             private = root / "scan-test"
             private.mkdir()
             for name in kit.GENERATED_JSON:
-                (private / name).write_text("{}", encoding="utf-8")
+                (private / name).write_text(name, encoding="utf-8")
             (private / "run.log").write_text("private", encoding="utf-8")
-            exported = kit.export_project_reports(project, private)
-            self.assertEqual(exported, project / "reports" / private.name)
-            self.assertEqual({p.name for p in exported.iterdir()}, set(kit.GENERATED_JSON))
-            self.assertEqual((project / "reports" / ".gitignore").read_text().strip(), "*")
+            statuses = {
+                scanner: {"status": "success", "report": str(private / filename)}
+                for scanner, filename in kit.REPORTS.items()
+            }
+            statuses["grype"]["additionalReports"] = [str(private / "grype-sbom-report.json")]
+            kit.export_project_reports(destination, destination.stat(), private, statuses)
+            self.assertEqual({path.name for path in destination.iterdir()}, set(kit.GENERATED_JSON))
             for name in kit.GENERATED_JSON:
-                self.assertEqual((exported / name).read_bytes(), (private / name).read_bytes())
+                self.assertEqual((destination / name).read_bytes(), (private / name).read_bytes())
 
     def test_platforms_and_assets(self):
         for system, machine, expected in [
@@ -93,11 +97,42 @@ class StarterKitTests(unittest.TestCase):
 
     def test_missing_arm_package_is_reported_without_download(self):
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(starter_install, "fetch", return_value=b'{"assets": []}') as fetch:
+             patch.object(starter_install, "fetch") as fetch:
             installer = starter_install.Installer("windows", "arm64", Path(directory), True, None)
-            with self.assertRaisesRegex(RuntimeError, r"No upstream gitleaks .* windows/arm64"):
+            with self.assertRaisesRegex(RuntimeError, r"No verified upstream grype .* windows/arm64"):
+                installer.install_archive("grype")
+            fetch.assert_not_called()
+
+    def test_intel_macos_semgrep_uses_verified_wheel_and_versioned_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            installer = starter_install.Installer("macos", "amd64", cache, True, None)
+            base = cache / f"semgrep-1.182.1-{sys.version_info.major}.{sys.version_info.minor}"
+            script = base / "bin/semgrep"
+            script.parent.mkdir(parents=True)
+            script.touch()
+            with patch.object(starter_install, "run", return_value="pip 25.3") as run:
+                installer.install_pypi("semgrep")
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], base / "bin/python")
+            self.assertIn("--only-binary=:all:", command)
+            self.assertRegex(command[-1], r"^https://files\.pythonhosted\.org/.*/semgrep-1\.182\.1-"
+                                          r".*-macosx_10_14_x86_64\.whl#sha256=[0-9a-f]{64}$")
+            self.assertEqual(installer.managed("semgrep"), [str(script)])
+            for system, arch in (("macos", "arm64"), ("windows", "amd64"), ("linux", "amd64"), ("linux", "arm64")):
+                other = starter_install.Installer(system, arch, cache, True, None)
+                self.assertEqual(other.pypi_package("semgrep"), ("1.186.0", "semgrep==1.186.0"))
+
+    def test_pinned_release_rejects_checksum_mismatch_without_api_request(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(starter_install, "fetch", return_value="0" * 64) as fetch:
+            installer = starter_install.Installer("macos", "arm64", Path(directory), True, None)
+            with self.assertRaisesRegex(RuntimeError, r"Download checksum mismatch"):
                 installer.install_archive("gitleaks")
             fetch.assert_called_once()
+            url, _, algorithm = fetch.call_args.args
+            self.assertTrue(url.startswith("https://github.com/gitleaks/gitleaks/releases/download/"))
+            self.assertEqual(algorithm, "sha256")
 
     def test_native_launcher_and_private_report_directory(self):
         bash = host_bash()
@@ -143,13 +178,13 @@ class StarterKitTests(unittest.TestCase):
             bundle = root / "kit"
             bundle.mkdir()
             script = bundle / "security-scan.sh"
-            shutil.copyfile(kit.KIT / script.name, script)
+            shutil.copyfile(kit.KIT / "scripts/security-scan.template.sh", script)
             for filename in kit.TOOLKIT_FILES:
                 (bundle / filename).touch()
             def launch(*arguments):
                 # Hide Python and make any package manager call observable.
                 return subprocess.run(
-                    [bash, "-c", 'cd -- "$1" || exit; shift; export PATH=./missing-bin ACCIDION_HOME=./home; '
+                    [bash, "-c", 'cd -- "$1" || exit; shift; export PATH=./missing-bin ACCIDION_HOME=./home UV_PYTHON_INSTALL_DIR=./unused-python; '
                      'uname() { case "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; esac; }; '
                      'dirname() { printf "%s\\n" "${2%/*}"; }; '
                      'brew() { echo "bootstrap attempted" >&2; return 1; }; '
@@ -244,11 +279,30 @@ class StarterKitTests(unittest.TestCase):
             self.assertIsNone(installer.ensure("gitleaks"))
             self.assertEqual(installer.records["gitleaks"]["status"], "installation_failed")
 
+    def test_debian_recovers_partially_created_scanner_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            installer = starter_install.Installer("linux", "amd64", cache, True, None)
+            base = cache / f"semgrep-{starter_install.PYPI['semgrep']}-{sys.version_info.major}.{sys.version_info.minor}"
+            base.mkdir()
+            with patch.object(starter_install, "linux_family", return_value="debian"), \
+                 patch.object(starter_install, "run", side_effect=[RuntimeError("pip missing"),
+                              RuntimeError("ensurepip missing"), "", "pip 25.3", ""]) as runner, \
+                 patch.object(installer, "bootstrap_pip") as bootstrap:
+                installer.install_pypi("semgrep")
+            self.assertEqual(runner.call_args_list[2].args[0],
+                             [sys.executable, "-m", "venv", "--clear", "--without-pip", base])
+            bootstrap.assert_called_once_with(base / "bin/python")
+            self.assertEqual(installer.records["pip:semgrep"]["status"], "installed")
+
     @staticmethod
     def populate(project):
+        project.mkdir(parents=True, exist_ok=True)
+        if git := shutil.which("git"):
+            subprocess.run([git, "init", "-q", project], check=True)
         paths = ["src/main/java/example/Main.java", "pom.xml", "module/pom.xml", "mvnw", "mvnw.cmd",
                  "sidecar/build.gradle.kts", "sidecar/gradlew", "sidecar/gradlew.bat",
-                 "target/app.jar", "Dockerfile", "deploy/main.tf", ".git/Hidden.java"]
+                 "target/app.jar", "Dockerfile", "deploy/main.tf", ".cache/Hidden.java"]
         for name in paths:
             path = project / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,7 +394,7 @@ public class Main {
         for system, arch in [("windows", "amd64"), ("macos", "arm64"),
                              ("macos", "amd64"), ("linux", "amd64")]:
             with self.subTest(system=system, arch=arch), tempfile.TemporaryDirectory() as root:
-                project = Path(root) / "external app"
+                project = Path(root).resolve() / "external app"
                 self.populate(project)
                 discovered = kit.discover(project)
                 self.assertEqual(len(discovered["java"]), 1)
@@ -355,7 +409,7 @@ public class Main {
                     installer.records[name] = {"status": "reused", "version": "123.4"}
                     return [name]
 
-                home = Path(root) / "kit-data"
+                home = Path(root).resolve() / "kit-data"
                 with patch.dict(os.environ, {"ACCIDION_HOME": str(home), "ACCIDION_KIT_COMMIT": "1" * 40,
                                              "ACCIDION_KIT_ARCHIVE_SHA256": "2" * 64}), \
                      patch.object(kit.Installer, "ensure", ensure), \
@@ -369,6 +423,7 @@ public class Main {
                     runner.assert_not_called()
                     options = kit.args_for(["--project-path", str(project), "--setup-only"])
                     self.assertEqual(kit.execute(options, system, arch), 0)
+                    self.assertFalse((project / "reports").exists())
                     runner.assert_not_called()
                     options = kit.args_for(["--project-path", str(project), "--build-image", "--details", "--verbose"])
                     self.assertEqual(kit.execute(options, system, arch), 0)
@@ -378,6 +433,8 @@ public class Main {
                                                 "syft", "syft", "grype", "grype", "checkov"])
                 application_reports = home / "reports/external-java-app"
                 reports = sorted(application_reports.iterdir())[-1]
+                for filename in kit.GENERATED_JSON:
+                    self.assertEqual((project / "reports" / filename).read_bytes(), (reports / filename).read_bytes())
                 self.assertEqual(set(p.name for p in reports.glob("*.json")),
                                  set(kit.REPORTS.values()) | {"security-summary.json", "grype-sbom-report.json"})
                 summary = json.loads((reports / "security-summary.json").read_text())
@@ -467,7 +524,7 @@ public class Main {
 
     def test_vulnerability_caches_persist_across_separate_runs(self):
         with tempfile.TemporaryDirectory() as root:
-            home = Path(root) / "data"
+            home = Path(root).resolve() / "data"
             project = Path(root) / "app"
             self.populate(project)
             cache_marker_seen = {"dependency-check": [], "grype": []}
@@ -507,7 +564,7 @@ public class Main {
     def test_large_maven_scan_shares_index_and_declaration_cache(self):
         with tempfile.TemporaryDirectory() as root:
             home = Path(root) / "data"
-            project = Path(root) / "app"
+            project = Path(root).resolve() / "app"
             self.populate(project)
             original = (project / "pom.xml").read_text()
             (project / "pom.xml").unlink()
@@ -531,7 +588,7 @@ public class Main {
             def node(artifact, version="1.0", children=()):
                 return dict(groupId="test", artifactId=artifact, version=version, children=list(children))
 
-            def resolve(_project, builds, deps, _log, _diagnostic):
+            def resolve(_project, builds, deps, _log, _diagnostic, *, timeout=3600):
                 for number, (family, _, _) in enumerate(builds):
                     if family != "maven":
                         continue
@@ -651,6 +708,57 @@ public class Main {
         self.assertEqual(kit.report_application_directory("Acme / Orders"), "acme-orders")
         self.assertEqual(kit.report_application_directory(".."), "application")
 
+    def test_report_export_rejects_a_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, outside = root / "app", root / "outside"
+            app.mkdir()
+            outside.mkdir()
+            protected = outside / "security-summary.json"
+            protected.write_text("developer file")
+            try:
+                (app / "reports").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Directory symlinks unavailable: {error}")
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(root / "home")}), \
+                 self.assertRaisesRegex(ValueError, "Project report export.*Unsafe report path"):
+                kit.execute(kit.args_for(["--project-path", str(app)]), *kit.detect())
+            self.assertEqual(protected.read_text(), "developer file")
+
+    def test_report_export_preserves_tracked_output_paths(self):
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("Git unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            reports = app / "reports"
+            reports.mkdir(parents=True)
+            protected = reports / "security-summary.json"
+            protected.write_text("tracked developer file")
+            subprocess.run([git, "init", "-q", app], check=True)
+            subprocess.run([git, "-C", app, "add", "-f", "reports/security-summary.json"], check=True)
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(root / "home")}), \
+                 self.assertRaisesRegex(ValueError, "Project report export.*tracked by Git"):
+                kit.execute(kit.args_for(["--project-path", str(app)]), *kit.detect())
+            self.assertEqual(protected.read_text(), "tracked developer file")
+
+    def test_export_failure_reports_the_private_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            app.mkdir()
+            home = root / "home"
+            options = kit.args_for(["--project-path", str(app), "--scanner", "dependency-check", "--no-install"])
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(home)}), \
+                 patch.object(kit, "export_project_reports", side_effect=PermissionError("publisher denied")), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(kit.execute(options, *kit.detect()), 2)
+            self.assertFalse((app / "reports/security-summary.json").exists())
+            private = next((home / "reports").rglob("security-summary.json"))
+            self.assertIn(str(private.parent.resolve()), errors.getvalue())
+            self.assertIn("Project report export failed: publisher denied", errors.getvalue())
+
     def test_failed_scanner_does_not_prevent_other_applicable_scans(self):
         with tempfile.TemporaryDirectory() as root:
             project = Path(root) / "app"
@@ -686,6 +794,9 @@ public class Main {
             self.assertEqual(summary["scanners"]["semgrep"]["findingCount"], 1)
             self.assertIn("simulated network or permission failure", summary["scanners"]["semgrep"]["reason"])
             self.assertTrue((home / "reports/app/0/semgrep-report.json").exists())
+            self.assertFalse((project / "reports/semgrep-report.json").exists())
+            self.assertFalse((project / "reports/gitleaks-report.json").exists())
+            self.assertTrue((project / "reports/grype-report.json").exists())
             self.assertEqual(summary["scanners"]["grype"]["status"], "success")
             self.assertEqual(summary["scanners"]["checkov"]["status"], "skipped")
             self.assertEqual(summary["installations"]["checkov"]["status"], "skipped")
@@ -765,7 +876,7 @@ public class Main {
 
     def test_dependency_paths_include_direct_and_multiple_transitive_parents(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             project = root / "app"
             project.mkdir()
             pom = project / "pom.xml"
@@ -1065,7 +1176,7 @@ class BootstrapTests(unittest.TestCase):
             '[[ " $* " == *" --config - "* ]] || { echo "missing stdin config" >&2; exit 10; }\n'
             'read -r auth\n[[ $auth == "header = \\"Authorization: Bearer $MOCK_TOKEN\\"" ]] || { echo "unexpected bearer" >&2; exit 10; }\n'
             'case " $* " in\n'
-            '  *"https://api.github.com/user "*) [[ ${MOCK_USER_DENIED:-0} == 0 ]]; printf 200; exit ;;\n'
+            '  *"https://api.github.com/user "*) [[ ${MOCK_USER_DENIED:-0} == 0 ]] || exit 22; printf 200; exit ;;\n'
             '  *"/contents/bootstrap.sh?ref=$MOCK_PIN "*) input=$MOCK_BOOTSTRAP ;;\n'
             '  *"/tarball/$MOCK_PIN "*) [[ ${MOCK_ARCHIVE_FAIL:-0} == 0 ]] || exit 22; input=$MOCK_ARCHIVE ;;\n'
             '  *) exit 11 ;;\nesac\n'
@@ -1076,7 +1187,7 @@ class BootstrapTests(unittest.TestCase):
         self.mock_script(mock / "gh",
             '#!/usr/bin/env bash\nset -eu\n'
             'case "$1" in\n'
-            '  auth) [[ ${MOCK_GH_LOGIN:-0} == 1 ]]; printf "%s\\n" "$MOCK_TOKEN" ;;\n'
+            '  auth) [[ ${MOCK_GH_LOGIN:-0} == 1 ]] || exit 1; printf "%s\\n" "$MOCK_TOKEN" ;;\n'
             '  repo) [[ " $* " == *" $MOCK_REPO "* && $MOCK_HTTP_CODE == 404 ]]; echo true ;;\n'
             '  api) [[ " $* " == *"repos/$MOCK_REPO/contents/bootstrap.sh?ref=$MOCK_PIN " ]]; cat -- "$MOCK_BOOTSTRAP" ;;\n'
             '  release) [[ " $* " == *" kit-$MOCK_PIN "* && " $* " == *" $MOCK_REPO "* &&'
@@ -1085,7 +1196,7 @@ class BootstrapTests(unittest.TestCase):
         self.mock_script(mock / "git",
             '#!/usr/bin/env bash\nset -eu\n'
             'if [[ $1 == -C && $3 == credential && $4 == fill ]]; then\n'
-            '  [[ ${MOCK_CREDENTIAL_LOGIN:-0} == 1 && $GIT_TERMINAL_PROMPT == 0 && $GCM_INTERACTIVE == Never ]]\n'
+            '  [[ ${MOCK_CREDENTIAL_LOGIN:-0} == 1 && $GIT_TERMINAL_PROMPT == 0 && $GCM_INTERACTIVE == Never ]] || exit 1\n'
             '  [[ $GIT_CEILING_DIRECTORIES == "${2%/*}" && ! "$2" -ef "$MOCK_KIT" ]]\n'
             '  read -r protocol; read -r host; read -r path\n'
             '  [[ $protocol == protocol=https && $host == host=github.com && $path == path=*.git ]]\n'

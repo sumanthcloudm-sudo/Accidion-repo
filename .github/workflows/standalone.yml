@@ -1,0 +1,216 @@
+name: Standalone security scan
+
+on:
+  push:
+    branches: [main, standalone-cross-platform]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      live_scanners:
+        description: Download scanners and vulnerability databases, then run the copied script
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify reproducible LF distribution and Bash syntax
+        run: |
+          python scripts/build_standalone.py --check
+          bash -n security-scan.sh
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Verify stock macOS Bash 3.2
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash -c '[[ ${BASH_VERSINFO[0]} == 3 && ${BASH_VERSINFO[1]} == 2 ]]'
+          app="$RUNNER_TEMP/legacy bash app"
+          mkdir -p "$app"
+          cp security-scan.sh "$app/"
+          cd "$app"
+          export ACCIDION_HOME="$RUNNER_TEMP/legacy tool home"
+          /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
+          /bin/bash security-scan.sh --no-install --scanner dependency-check --report-dir "$RUNNER_TEMP/legacy reports"
+          test -f security-scan.properties
+          test -s reports/security-summary.json
+          printf 'PROJECT_ROOT=\nOUTPUT_DIR=\nSCANNERS=\nDOCKER_IMAGE=\nBUILD_IMAGE=\n' > security-scan.properties
+          /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
+          printf 'SCANNERS=gitleaks\n' > security-scan.properties
+          /bin/bash security-scan.sh --dry-run --no-install --report-dir "$RUNNER_TEMP/legacy reports"
+          printf 'SCANNERS=dependency-check\nOUTPUT_DIR=\n' > security-scan.properties
+          /bin/bash security-scan.sh
+
+  live:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.live_scanners)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'push' && '["macos-15", "macos-15-intel"]' || '["ubuntu-24.04", "ubuntu-24.04-arm", "windows-latest", "macos-15", "macos-15-intel"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Copy only the distribution and create application fixtures
+        run: |
+          app="$RUNNER_TEMP/fresh application"
+          mkdir -p "$app"
+          cp security-scan.sh "$app/"
+          printf '%s\n' 'class Example {}' > "$app/Example.java"
+          printf '%s\n' 'FROM scratch' 'COPY Example.java /Example.java' > "$app/Dockerfile"
+          printf '%s\n' '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>example</groupId><artifactId>fixture</artifactId><version>1.0</version><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version></dependency></dependencies></project>' > "$app/pom.xml"
+      - name: Bootstrap and reuse Python with no interpreter on PATH
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: |
+          bin="$RUNNER_TEMP/bootstrap-bin"
+          mkdir -p "$bin"
+          checksum=sha256sum
+          if [[ "$RUNNER_OS" == macOS ]]; then checksum=shasum; fi
+          for tool in uname dirname cat mktemp rm curl awk "$checksum" tar gzip mkdir find chmod git; do
+            ln -s "$(command -v "$tool")" "$bin/$tool"
+          done
+          export ACCIDION_HOME="$RUNNER_TEMP/clean bootstrap home"
+          export UV_PYTHON_INSTALL_DIR="$RUNNER_TEMP/managed python"
+          cd "$RUNNER_TEMP/fresh application"
+          PATH="$bin" /bin/bash security-scan.sh --setup-only --scanner gitleaks
+          PATH="$bin" /bin/bash security-scan.sh --setup-only --no-install --scanner gitleaks
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          reports = sorted(Path(os.environ["ACCIDION_HOME"]).rglob("security-summary.json"),
+                           key=lambda report: report.stat().st_mtime_ns)
+          assert len(reports) == 2, reports
+          for report, expected in zip(reports, ("installed", "reused")):
+              installations = json.loads(report.read_text(encoding="utf-8"))["installations"]
+              for tool in ("python", "gitleaks"):
+                  assert installations[tool]["status"] == expected, (tool, installations[tool])
+              print(f"Python and Gitleaks: {expected}")
+          PY
+      - name: Run the bare launcher twice with stock macOS Bash
+        if: (success() || failure()) && runner.os == 'macOS'
+        env:
+          ACCIDION_NVD_MIRROR: https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/nvdcve-{0}.json.gz
+        run: |
+          /bin/bash -c '[[ ${BASH_VERSINFO[0]} == 3 && ${BASH_VERSINFO[1]} == 2 ]]'
+          export ACCIDION_HOME="$RUNNER_TEMP/clean accidion home"
+          export UV_PYTHON_INSTALL_DIR="$RUNNER_TEMP/managed python"
+          cd "$RUNNER_TEMP/fresh application"
+          test ! -e security-scan.properties
+          for pass in first repeat; do
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash security-scan.sh
+            test -s security-scan.properties
+            grep -Fxq 'SCANNERS=all' security-scan.properties
+            if [[ "$pass" == first ]]; then
+              cp security-scan.properties "$RUNNER_TEMP/first-scan.properties"
+            else
+              cmp security-scan.properties "$RUNNER_TEMP/first-scan.properties"
+            fi
+          done
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          arch = {"ARM64": "arm64", "X64": "amd64"}[os.environ["RUNNER_ARCH"]]
+          reports = sorted(Path(os.environ["ACCIDION_HOME"]).rglob("security-summary.json"),
+                           key=lambda report: report.stat().st_mtime_ns)
+          assert len(reports) == 2, reports
+          names = {"gitleaks", "semgrep", "dependency-check", "syft", "grype", "checkov"}
+          for report, expected in zip(reports, ("installed", "reused")):
+              summary = json.loads(report.read_text(encoding="utf-8"))
+              assert (summary["platform"], summary["architecture"]) == ("macos", arch), summary
+              assert set(summary["scanners"]) == names, summary["scanners"]
+              for scanner, entry in summary["scanners"].items():
+                  assert entry["status"] == "success", (scanner, entry)
+                  assert entry["installationStatus"] == expected, (scanner, entry)
+                  if scanner == "semgrep":
+                      version = "1.182.1" if arch == "amd64" else "1.186.0"
+                      assert entry["version"] == version, entry
+                  json.loads(Path(entry["report"]).read_text(encoding="utf-8"))
+                  print(f"{scanner}: {expected}, successful, valid JSON")
+          project_reports = Path("reports")
+          assert (project_reports / "security-summary.json").read_bytes() == reports[-1].read_bytes()
+          for entry in summary["scanners"].values():
+              private = Path(entry["report"])
+              assert (project_reports / private.name).read_bytes() == private.read_bytes()
+          PY
+      - name: Report macOS installer and scanner failures
+        if: failure() && runner.os == 'macOS'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          for home in ("clean bootstrap home", "clean accidion home"):
+              for report in (Path(os.environ["RUNNER_TEMP"]) / home).rglob("security-summary.json"):
+                  summary = json.loads(report.read_text(encoding="utf-8"))
+                  print(home, report.parent.name)
+                  for section in ("installations", "scanners"):
+                      for name, entry in summary[section].items():
+                          if entry["status"] in {"failed", "unavailable", "installation_failed"}:
+                              print(section, name, entry["status"], entry["reason"])
+          PY
+      - name: Provision missing scanners and reuse them in a real scan
+        if: runner.os != 'macOS'
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          export ACCIDION_HOME="$RUNNER_TEMP/clean accidion home"
+          cd "$RUNNER_TEMP/fresh application"
+          bash security-scan.sh --setup-only --verbose
+          bash security-scan.sh --no-install --verbose
+      - name: Verify all applicable report files and scanner reuse
+        if: runner.os != 'macOS'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          home = Path(os.environ["RUNNER_TEMP"]) / "clean accidion home"
+          path = max((home / "reports").rglob("security-summary.json"),
+                     key=lambda report: report.stat().st_mtime)
+          summary = json.loads(path.read_text(encoding="utf-8"))
+          project_reports = Path(os.environ["RUNNER_TEMP"]) / "fresh application" / "reports"
+          assert (project_reports / path.name).read_bytes() == path.read_bytes()
+          for scanner, entry in summary["scanners"].items():
+              assert entry["status"] == "success", (scanner, entry["reason"])
+              assert entry["installationStatus"] == "reused", scanner
+              json.loads(Path(entry["report"]).read_text(encoding="utf-8"))
+              private = Path(entry["report"])
+              assert (project_reports / private.name).read_bytes() == private.read_bytes()
+          PY
+      - name: Build and scan a local Docker image
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          export ACCIDION_HOME="$RUNNER_TEMP/clean accidion home"
+          cd "$RUNNER_TEMP/fresh application"
+          bash security-scan.sh --no-install --scanner grype --build-image
