@@ -6,7 +6,7 @@ Accidion is designed to run from **Windows (Git Bash), Linux (Bash), or macOS (B
 
 ## 1. Purpose of the security scripts
 
-Copy the approved [standalone launcher](dist/security-scan.sh) into the application directory. The launcher extracts its embedded components to a temporary directory outside the application.
+Run the approved [standalone launcher](security-scan.sh) from the application root. Use `bash security-scan.sh` for a local copy or `bash "/path/to/Accidion-repo/security-scan.sh"` for the central launcher. The launcher extracts its embedded components to a temporary directory outside the application.
 
 When you run the launcher against your own application, Accidion:
 
@@ -15,7 +15,7 @@ When you run the launcher against your own application, Accidion:
 3. Detects the operating system and CPU architecture.
 4. Verifies or, where supported and permitted, installs required tools; existing compatible tools and cached data may be reused.
 5. Runs applicable scanners and records success, failure, skipped checks and unavailable tools.
-6. Creates private JSON reports, a consolidated findings summary, and a diagnostic log.
+6. Refreshes JSON reports and a consolidated summary in the application’s `reports/` folder and retains private diagnostics.
 
 **Accidion automatically discovers Java application components in the current working directory (or the configured application root) and executes the applicable security scanners.**
 
@@ -42,7 +42,7 @@ Detection does not mean automatic remediation. Developers review findings, updat
 
 ## 2. Security scanning launcher: security-scan.sh
 
-**Main launcher:** [dist/security-scan.sh](dist/security-scan.sh)
+**Main launcher:** [security-scan.sh](security-scan.sh)
 
 Copy this file as `security-scan.sh`. It contains the supporting scripts and default scanner configuration.
 
@@ -89,7 +89,7 @@ updater has stopped before using a fresh private cache.
 
 ### Scanner execution commands — choose one per run
 
-After copying the standalone launcher, enter your Java application root containing `pom.xml`. Accidion automatically discovers Maven and applicable application files. Choose one command below based on what you want to scan. These examples assume default properties unless overridden by the command. Run only the command you need today; there is no requirement to run every scanner each time. All commands use Bash/Git Bash on the developer's laptop, from the application root.
+Enter your Java application root containing `pom.xml`. Accidion automatically discovers Maven and applicable application files. The examples use a local launcher. You can substitute the central launcher's absolute path. Run the command for the scanners you want to use. These examples assume default properties unless overridden by the command.
 
 #### Complete security scan
 
@@ -229,7 +229,7 @@ Accidion may provision some missing prerequisites/tools on supported systems, bu
 
 ### Step 3 — Copy the standalone launcher
 
-Copy the approved [dist/security-scan.sh](dist/security-scan.sh) to the application directory and keep the filename `security-scan.sh`.
+Copy the approved [security-scan.sh](security-scan.sh) to the application directory and keep the filename `security-scan.sh`.
 
 ### Step 4 — Enter your Java application's root directory
 
@@ -332,7 +332,7 @@ DOCKER_IMAGE=
 BUILD_IMAGE=false
 ```
 
-Replace those paths with the actual application and report paths. On Windows, use the paths appropriate to Git Bash/your filesystem instead; do not copy Linux paths to Windows. **The report directory must be outside your application directory** to avoid accidentally scanning or committing sensitive results.
+Replace those paths with your application and private report paths. On Windows, use paths appropriate to Git Bash. Keep the private report directory outside the application. The launcher manages the project JSON export separately.
 
 To configure Maven-only scanning as a recurring default, use `SCANNERS=dependency-check`, `DOCKER_IMAGE=` and `BUILD_IMAGE=false`. For Docker-only scanning, use `SCANNERS=grype`, `DOCKER_IMAGE=my-app:latest` and `BUILD_IMAGE=false`. Run the same launcher after saving. For occasional scanner selection, keep default properties and use command-line flags instead. Clear configured Docker properties before switching to a scanner that does not include Grype.
 
@@ -342,17 +342,19 @@ Alternatively, keep properties at their defaults and pass values directly:
 bash security-scan.sh --project-path "/path/to/my-java-app" --report-dir "/path/to/private-reports"
 ```
 
-The launcher reads properties at startup and applies explicit command-line overrides. Use `--config PATH` to read an existing alternative. Keep reports outside the application.
+The launcher reads properties at startup and applies explicit command-line overrides. Use `--config PATH` to read an existing alternative. `--report-dir` and `OUTPUT_DIR` control private storage.
 
 ## 5. Security reports: where to find them and how to read them
 
-After a scan, Accidion prints the **exact report location**. By default, reports are saved privately on the developer's laptop under:
+After a full scan, open `reports/security-summary.json` in the application root. Accidion refreshes its JSON files on every full scan, recreates missing files and directories, and preserves unrelated files. The project folder gets sanitized JSON for successful scanners and the summary records failed, unavailable, skipped and unselected scanner statuses. Local Git exclusions protect generated files, and subsequent scans exclude the report folder. Dry runs and setup-only runs leave it alone.
+
+Accidion also prints the private run location. By default, private history is saved under:
 
 ```text
 ~/.accidion/reports/<application-name>/scan-<timestamp>-<id>/
 ```
 
-A new scan creates a separate run directory. Your application source is **not automatically modified**, and scan reports are **not automatically committed to your Java application's Git repository**.
+A new scan creates a separate private run directory with `run.log` and available diagnostics, including partial scanner output and Maven dependency trees. Unsafe destinations, tracked report paths and export failures produce explicit errors.
 
 | Report file | What the developer learns |
 | --- | --- |
@@ -399,4 +401,4 @@ Do not publish reports containing sensitive project information or credentials. 
 
 ---
 
-**Developer workflow in one sentence:** Build and test your own Java application → copy the standalone launcher → enter that application's root → run `security-scan.sh` → review private JSON findings → fix your application → rescan.
+From the application root, run the standalone launcher, review `reports/security-summary.json`, fix the findings and rescan.

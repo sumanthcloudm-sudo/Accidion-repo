@@ -33,12 +33,20 @@ compatible approved Semgrep installation when available. The workflow's
 
 ## Quick Start
 
-Copy the approved [standalone security-scan.sh](dist/security-scan.sh) into
+Copy the approved [standalone security-scan.sh](security-scan.sh) into
 your application directory. In that directory, open Bash (Git Bash on Windows)
 and run:
 
 ```bash
 bash security-scan.sh
+```
+
+You can also run the central launcher by absolute path while your shell is in
+the application root. Git Bash accepts drive-letter paths such as
+`C:/tools/Accidion-repo/security-scan.sh`.
+
+```bash
+bash "/path/to/Accidion-repo/security-scan.sh"
 ```
 
 Python 3.10+ is required and the launcher can attempt user-local setup.
@@ -224,7 +232,19 @@ the application directory.
 
 ## Security Reports
 
-Reports are generated in the configured output directory
+Full scans automatically create and refresh `<application-root>/reports/`.
+Open `reports/security-summary.json` in IntelliJ IDEA or VS Code to review
+scanner statuses and findings. The folder contains sanitized JSON from
+successful scanners. A failed, unavailable, skipped or unselected scanner
+has a status in the summary and no project JSON. The next full scan recreates
+missing reports and leaves unrelated files in the folder alone.
+
+Accidion protects its generated files with local Git exclusions and excludes
+the report folder from scan inputs. A tracked report path, unsafe destination,
+or Git rules that prevent local exclusion cause an explicit error. Dry runs
+and setup-only runs leave the application report folder alone.
+
+Each run keeps its private diagnostics in the configured output directory
 or the default location:
 
 ```text
@@ -240,7 +260,10 @@ Depending on the selected scanners, the following reports are generated:
 - grype-report.json
 - checkov-report.json
 - security-summary.json
-- run.log
+
+The private run also contains `run.log`, available partial scanner output and
+Maven dependency-tree diagnostics. Combined container and package scans can
+also export `grype-sbom-report.json`.
 
 Successful scanner execution does not mean the application
 is free of vulnerabilities. Developers must review the findings

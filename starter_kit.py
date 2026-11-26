@@ -2,11 +2,14 @@
 import argparse
 import csv
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 import functools
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,7 +35,7 @@ REPORTS = {
 }
 GENERATED_JSON = (*REPORTS.values(), "grype-sbom-report.json", "security-summary.json")
 IGNORED = {".git", ".gradle", ".venv", "venv", "node_modules", ".terraform",
-           ".cache", "__pycache__", ".pytest_cache", "reports"}
+           ".cache", "__pycache__", ".pytest_cache"}
 MANIFESTS = {
     "package.json": "javascript", "package-lock.json": "javascript", "yarn.lock": "javascript",
     "pnpm-lock.yaml": "javascript", "tsconfig.json": "typescript",
@@ -63,7 +66,8 @@ def discover(project):
 
     for directory, dirs, names in os.walk(project, onerror=raise_walk_error):
         base = Path(directory)
-        dirs[:] = sorted(d for d in dirs if d not in IGNORED and not (base / d).is_symlink())
+        dirs[:] = sorted(d for d in dirs if d not in IGNORED and d.casefold() != "reports"
+                         and not (base / d).is_symlink())
         generated = bool(set(base.relative_to(project).parts) & {"build", "target"})
         for name in sorted(names):
             path = base / name
@@ -497,7 +501,131 @@ def validate_report_directory(path, label):
             return
 
 
+def safe_report_path(path, expected_type):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not expected_type(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise ValueError(f"Unsafe report path: {path}")
+    return info
+
+
+def protect_project_reports(project):
+    git = shutil.which("git")
+    if not git:
+        if any(os.path.lexists(parent / ".git") for parent in (project, *project.parents)):
+            raise ValueError("Git is required to protect project reports from accidental commits")
+        return
+
+    def git_call(*args, allowed=(0,), input=None):
+        result = subprocess.run([git, "-C", project, *args], input=input, capture_output=True)
+        if result.returncode not in allowed:
+            raise ValueError(result.stderr.decode(errors="replace").strip() or f"git {args[0]} failed")
+        return result
+
+    if git_call("rev-parse", "--is-inside-work-tree", allowed=(0, 128)).stdout.strip() != b"true":
+        if any(os.path.lexists(parent / ".git") for parent in (project, *project.parents)):
+            raise ValueError("Git could not verify the application worktree")
+        return
+    paths = [f"reports/{name}" for name in GENERATED_JSON]
+    pathspecs = [f":(icase,literal){path}" for path in paths]
+    if git_call("ls-files", "-z", "--", *pathspecs).stdout:
+        raise ValueError("A generated report path is tracked by Git. Remove it from the index before scanning")
+    prefix = git_call("rev-parse", "--show-prefix").stdout.removesuffix(b"\n").removesuffix(b"\r")
+    if b"\n" in prefix or b"\r" in prefix:
+        raise ValueError("Cannot write literal Git exclusions for an application path containing a line break")
+    exclude = project / os.fsdecode(git_call("rev-parse", "--git-path", "info/exclude")
+                                    .stdout.removesuffix(b"\n").removesuffix(b"\r"))
+    safe_report_path(exclude.parent, stat.S_ISDIR)
+    exclude.parent.mkdir(exist_ok=True)
+    info = safe_report_path(exclude, stat.S_ISREG)
+    if info and info.st_nlink != 1:
+        raise ValueError(f"Unsafe Git exclusion file: {exclude}")
+    rules = {path.encode(): path.encode() for path in paths}
+    rules[b"reports/.accidion-export-probe/report.json"] = b"reports/.accidion-export-*/"
+
+    def ignored_paths(paths):
+        result = git_call("check-ignore", "-z", "--stdin", allowed=(0, 1),
+                          input=b"".join(path + b"\0" for path in paths))
+        return set(result.stdout.split(b"\0"))
+
+    missing = rules.keys() - ignored_paths(rules)
+    if missing:
+        with exclude.open("a+b") as output:
+            output.seek(0)
+            existing = set(output.read().splitlines())
+            directory = re.sub(rb"([\\*?\[\] ])", rb"\\\1", prefix)
+            new_rules = [b"/" + directory + rules[path] for path in sorted(missing)]
+            lines = [rule for rule in new_rules if rule not in existing]
+            if lines:
+                output.write(b"\n" + b"\n".join(lines) + b"\n")
+        if not missing.issubset(ignored_paths(missing)):
+            raise ValueError("Git ignore rules override the local report exclusions")
+
+
+def prepare_project_reports(project, home, stack):
+    # Keep the kernel lock outside the worktree and release it even on scan errors.
+    key = hashlib.sha256(os.fsencode(os.path.normcase(project))).hexdigest()
+    locks = home / "report-locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    safe_report_path(locks, stat.S_ISDIR)
+    lock_path = locks / key
+    safe_report_path(lock_path, stat.S_ISREG)
+    lock = stack.enter_context(lock_path.open("ab"))
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise ValueError(f"Could not lock project reports for {project}: {error}") from error
+
+    destination = project / "reports"
+    safe_report_path(destination, stat.S_ISDIR)
+    if os.path.lexists(destination / ".git"):
+        raise ValueError(f"Project reports cannot be written to a separate Git repository: {destination}")
+    protect_project_reports(project)
+    destination.mkdir(exist_ok=True)
+    identity = safe_report_path(destination, stat.S_ISDIR)
+    outputs = [destination / name for name in GENERATED_JSON]
+    for output in outputs:
+        safe_report_path(output, stat.S_ISREG)
+    for output in reversed(outputs):
+        output.unlink(missing_ok=True)
+    return destination, identity
+
+
+def export_project_reports(destination, identity, report_dir, statuses):
+    current = safe_report_path(destination, stat.S_ISDIR)
+    if current is None or not os.path.samestat(identity, current):
+        raise ValueError(f"Project report directory changed during the scan: {destination}")
+    scanner_reports = [
+        Path(path).name
+        for entry in statuses.values() if entry["status"] == "success"
+        for path in (entry["report"], *entry.get("additionalReports", ())) if path
+    ]
+    # Stage every sanitized JSON file before publication and publish the summary last.
+    with tempfile.TemporaryDirectory(prefix=".accidion-export-", dir=destination) as directory:
+        staging = Path(directory)
+        names = [*scanner_reports, "security-summary.json"]
+        for name in names:
+            shutil.copyfile(report_dir / name, staging / name)
+        for name in names:
+            safe_report_path(destination / name, stat.S_ISREG)
+        for name in names:
+            (staging / name).replace(destination / name)
+
+
 def execute(options, system, arch, *, in_memory_preview=False):
+    with ExitStack() as stack:
+        return execute_with_reports(options, system, arch, stack, in_memory_preview=in_memory_preview)
+
+
+def execute_with_reports(options, system, arch, stack, *, in_memory_preview=False):
     os.umask(0o077)
     for filename in (() if in_memory_preview and options.dry_run else TOOLKIT_FILES):
         path = KIT / filename
@@ -531,7 +659,8 @@ def execute(options, system, arch, *, in_memory_preview=False):
     package_app = java_app or any(files[technology] for technology in MANIFESTS.values())
     scan_exclusions = []
     launcher = os.environ.get("ACCIDION_STANDALONE_LAUNCHER")
-    toolkit = [KIT / name for name in (*TOOLKIT_FILES, "security-scan.sh", "python-bootstrap.sh", "dist/security-scan.sh")]
+    toolkit = [KIT / name for name in (*TOOLKIT_FILES, "security-scan.sh", "python-bootstrap.sh",
+                                       "scripts/security-scan.template.sh")]
     if launcher:
         toolkit.append(Path(launcher).resolve())
     for path in toolkit:
@@ -612,6 +741,11 @@ def execute(options, system, arch, *, in_memory_preview=False):
                           "scanners": applicability}, indent=2))
         return 0
 
+    if not options.setup_only:
+        try:
+            destination, report_identity = prepare_project_reports(project, home, stack)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise ValueError(f"Project report export could not be prepared: {error}") from error
     report_dir = private_run_path(application_reports)
     total_started = time.perf_counter()
     started = datetime.now(timezone.utc)
@@ -949,7 +1083,7 @@ def execute(options, system, arch, *, in_memory_preview=False):
                 finally:
                     statuses["dependency-check"]["commandSeconds"] = round(time.perf_counter() - command_started, 3)
 
-            excludes = ["--exclude", "**/.git/**"]
+            excludes = ["--exclude", "**/.git/**", "--exclude", "./reports/**"]
             for filename in GENERATED_JSON:
                 excludes.extend(("--exclude", f"**/{filename}"))
             for path in scan_exclusions:
@@ -1058,10 +1192,11 @@ def execute(options, system, arch, *, in_memory_preview=False):
             setup = "Setup-only mode" if options.setup_only else None
             def gitleaks(cmd, out):
                 config = KIT / ".gitleaks.toml"
-                if scan_exclusions:
+                if scan_exclusions or not options.setup_only:
                     # Match both native Windows separators and portable relative paths.
                     patterns = [r"(?:^|[\\/])" + r"[\\/]".join(map(re.escape, path.parts)) + "$"
                                 for path in scan_exclusions]
+                    patterns.append(r"(?:^|[\\/])reports[\\/]")
                     content = config.read_text(encoding="utf-8")
                     content = content.replace("paths = [", "paths = [" + ", ".join(
                         json.dumps(pattern, ensure_ascii=False) for pattern in patterns) + ", ", 1)
@@ -1073,6 +1208,7 @@ def execute(options, system, arch, *, in_memory_preview=False):
             execute_scan("gitleaks", gitleaks, setup)
             execute_scan("semgrep", lambda cmd, out: invoke(
                 cmd, "scan", "--config", KIT / "semgrep.yml", "--metrics=off", "--disable-version-check",
+                "--exclude=/reports/",
                 *(f"--exclude={filename}" for filename in GENERATED_JSON),
                 *(f"--exclude=/{path.as_posix()}" for path in scan_exclusions),
                 "--json", "--output", out, project, env=installer.semgrep_env), setup or applicability["semgrep"])
@@ -1113,6 +1249,13 @@ def execute(options, system, arch, *, in_memory_preview=False):
                "log": str(report_dir / "run.log")}
     summary["totalDurationSeconds"] = round(time.perf_counter() - total_started, 2)
     write_json(report_dir / "security-summary.json", redactor.data(summary))
+    export_failed = False
+    if not options.setup_only:
+        try:
+            export_project_reports(destination, report_identity, report_dir, statuses)
+        except (OSError, ValueError) as error:
+            print(f"Project report export failed: {error}. Private reports: {report_dir}", file=sys.stderr)
+            export_failed = True
     failures = {"unavailable", "installation_failed"}
     required = provision_scanners if options.setup_only else {
         name for name, entry in statuses.items() if entry["status"] != "skipped"
@@ -1167,6 +1310,10 @@ def execute(options, system, arch, *, in_memory_preview=False):
     filenames = sorted(path.name for path in report_dir.glob("*.json"))
     emit("  JSON reports: " + ", ".join(filenames))
     emit("  Log: run.log")
+    if not options.setup_only and not export_failed:
+        emit(f"Application JSON reports: {destination}")
+    if export_failed:
+        return 2
     return int(failed)
 
 

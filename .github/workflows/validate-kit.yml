@@ -26,8 +26,10 @@ jobs:
       - name: Validate Python syntax
         run: python -m py_compile starter_kit.py starter_install.py starter_findings.py
 
-      - name: Validate Bash launcher syntax
-        run: bash -n security-scan.sh
+      - name: Validate standalone launcher
+        run: |
+          python scripts/build_standalone.py --check
+          bash -n security-scan.sh
 
       - name: Validate launcher help
         run: bash security-scan.sh --help

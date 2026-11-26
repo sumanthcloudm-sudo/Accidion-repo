@@ -20,7 +20,115 @@ ROOT = Path(__file__).resolve().parents[1]
 class StandaloneTests(unittest.TestCase):
     def test_reproducible_distribution(self):
         subprocess.run([sys.executable, ROOT / "scripts/build_standalone.py", "--check"], check=True)
-        self.assertNotIn(b"\r", (ROOT / "dist/security-scan.sh").read_bytes())
+        self.assertNotIn(b"\r", (ROOT / "security-scan.sh").read_bytes())
+
+    def test_central_launcher_refreshes_application_reports(self):
+        bash, git = host_bash(), shutil.which("git")
+        if not bash or not git:
+            self.skipTest("Bash and Git are required")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "nested [app]"
+            app.mkdir()
+            subprocess.run([git, "init", "-q", root], check=True)
+            fake = root / "fake tools"
+            fake.mkdir()
+            script = fake / "fixture.py"
+            script.write_text(
+                'import os, pathlib, sys\n'
+                'if sys.argv[1] == "version":\n'
+                '    print("8.30.1")\n'
+                '    sys.exit(0)\n'
+                'if os.environ.get("FAIL_FIXTURE_SCANNER"):\n'
+                '    sys.exit(3)\n'
+                'pathlib.Path(sys.argv[sys.argv.index("--report-path") + 1]).write_text("[]")\n',
+                encoding="utf-8")
+            if os.name == "nt":
+                (fake / "gitleaks.cmd").write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+            else:
+                tool = fake / "gitleaks"
+                tool.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+                tool.chmod(0o700)
+            env = {**os.environ, "ACCIDION_HOME": str(root.parent / f"{root.name}-cache"),
+                   "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+            env.pop("ACCIDION_REQUIRED_SCANNERS", None)
+            cache = Path(env["ACCIDION_HOME"])
+            self.addCleanup(lambda: shutil.rmtree(cache) if cache.exists() else None)
+            reports = app / "reports"
+            scanner_report = reports / "gitleaks-report.json"
+            summary_report = reports / "security-summary.json"
+            properties = app / "security-scan.properties"
+            default_properties = (
+                b"# Security scan configuration\nPROJECT_ROOT=.\nOUTPUT_DIR=\n"
+                b"SCANNERS=all\nDOCKER_IMAGE=\nBUILD_IMAGE=false\n"
+            )
+
+            def scan(*args, expected=0, **overrides):
+                result = subprocess.run([bash, (ROOT / "security-scan.sh").as_posix(), *args],
+                                        cwd=app, env={**env, **overrides}, capture_output=True,
+                                        text=True, timeout=90)
+                self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
+                return result
+
+            scan("--dry-run")
+            scan("--setup-only", "--scanner=gitleaks", "--no-install")
+            self.assertFalse(reports.exists())
+            first = scan()
+            self.assertIn(str(reports.resolve()), first.stdout)
+            self.assertEqual(json.loads(scanner_report.read_text()), [])
+            summary = json.loads(summary_report.read_text())
+            self.assertEqual(Path(summary["project"]), app.resolve())
+            self.assertEqual(summary["scanners"]["gitleaks"]["status"], "success")
+            self.assertEqual(Path(summary["scanners"]["gitleaks"]["report"]).read_bytes(),
+                             scanner_report.read_bytes())
+            subprocess.run([git, "-C", app, "check-ignore", "reports/gitleaks-report.json",
+                            "reports/security-summary.json"], check=True, capture_output=True)
+            exclude = root / ".git/info/exclude"
+            rules = exclude.read_bytes()
+
+            notes = reports / "notes.txt"
+            notes.write_text("Keep this file")
+            (reports / "pom.xml").write_text("<project/>")
+            (reports / "Dockerfile").write_text("FROM scratch\n")
+            (reports / "deployment.yaml").write_text("apiVersion: v1\n")
+            scanner_report.write_text('["old"]')
+            scan("--dry-run")
+            scan("--setup-only", "--scanner=gitleaks", "--no-install")
+            self.assertEqual(scanner_report.read_text(), '["old"]')
+            scan()
+            self.assertEqual(json.loads(scanner_report.read_text()), [])
+            refreshed = json.loads(summary_report.read_text())
+            self.assertNotEqual(refreshed["scanStartedAt"], summary["scanStartedAt"])
+            self.assertEqual([refreshed["discovery"][kind] for kind in ("maven", "iac", "dockerfiles")], [0, 0, 0])
+            self.assertEqual(notes.read_text(), "Keep this file")
+            self.assertEqual(exclude.read_bytes(), rules)
+            self.assertEqual(subprocess.run([git, "-C", app, "check-ignore", "reports/notes.txt"],
+                                            capture_output=True).returncode, 1)
+
+            scanner_report.unlink()
+            scan()
+            self.assertTrue(scanner_report.is_file())
+            shutil.rmtree(reports)
+            scan()
+            self.assertTrue(scanner_report.is_file())
+            self.assertTrue(summary_report.is_file())
+
+            notes.write_text("Keep reports when only properties are deleted")
+            properties.unlink()
+            scan()
+            self.assertEqual(properties.read_bytes(), default_properties)
+            self.assertEqual(notes.read_text(), "Keep reports when only properties are deleted")
+
+            shutil.rmtree(reports)
+            properties.unlink()
+            scan()
+            self.assertEqual(properties.read_bytes(), default_properties)
+            self.assertEqual(json.loads(scanner_report.read_text()), [])
+            self.assertEqual(json.loads(summary_report.read_text())["scanners"]["gitleaks"]["status"], "success")
+
+            scan(expected=1, FAIL_FIXTURE_SCANNER="1")
+            self.assertFalse(scanner_report.exists())
+            self.assertEqual(json.loads(summary_report.read_text())["scanners"]["gitleaks"]["status"], "failed")
 
     def test_copy_only_with_properties_and_cli_overrides(self):
         bash = host_bash()
@@ -34,7 +142,7 @@ class StandaloneTests(unittest.TestCase):
             app.mkdir()
             private_temp.mkdir()
             launcher = app / "security-scan.sh"
-            shutil.copyfile(ROOT / "dist/security-scan.sh", launcher)
+            shutil.copyfile(ROOT / "security-scan.sh", launcher)
             env = {**os.environ, "ACCIDION_HOME": str(root / "home"), "TMPDIR": str(private_temp)}
             if os.name == "nt":
                 env["TMPDIR"] = private_temp.as_posix()
@@ -76,7 +184,7 @@ class StandaloneTests(unittest.TestCase):
             app.mkdir()
             temp.mkdir()
             launcher = app / "security-scan.sh"
-            shutil.copyfile(ROOT / "dist/security-scan.sh", launcher)
+            shutil.copyfile(ROOT / "security-scan.sh", launcher)
             source = app / "hello.txt"
             source.write_bytes(b"Existing application content")
             properties = app / "security-scan.properties"
@@ -153,7 +261,7 @@ class StandaloneTests(unittest.TestCase):
             app = root / "app"
             app.mkdir()
             launcher = app / "security-scan.sh"
-            shutil.copyfile(ROOT / "dist/security-scan.sh", launcher)
+            shutil.copyfile(ROOT / "security-scan.sh", launcher)
             binaries = root / "minimal path"
             binaries.mkdir()
             for name in ("uname", "dirname", "cat", "mktemp", "rm"):

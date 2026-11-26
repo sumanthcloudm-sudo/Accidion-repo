@@ -37,7 +37,7 @@ raise SystemExit(module.main(in_memory_preview=True))
 
 
 def build():
-    launcher = (ROOT / "security-scan.sh").read_text(encoding="utf-8")
+    launcher = (ROOT / "scripts" / "security-scan.template.sh").read_text(encoding="utf-8")
     _, body = launcher.split("\n", 1)
     lines = [
         "#!/usr/bin/env bash",
@@ -60,13 +60,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Fail if the distribution needs rebuilding")
     args = parser.parse_args()
-    output = ROOT / "dist" / "security-scan.sh"
+    output = ROOT / "security-scan.sh"
     generated = build()
     if args.check:
         if not output.is_file() or output.read_bytes() != generated:
-            parser.exit(1, "Run python scripts/build_standalone.py to refresh dist/security-scan.sh\n")
+            parser.exit(1, "Run python scripts/build_standalone.py to refresh security-scan.sh\n")
     else:
-        output.parent.mkdir(exist_ok=True)
         output.write_bytes(generated)
         output.chmod(0o755)
 

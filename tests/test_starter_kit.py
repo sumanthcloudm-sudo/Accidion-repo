@@ -158,7 +158,7 @@ class StarterKitTests(unittest.TestCase):
             bundle = root / "kit"
             bundle.mkdir()
             script = bundle / "security-scan.sh"
-            shutil.copyfile(kit.KIT / script.name, script)
+            shutil.copyfile(kit.KIT / "scripts/security-scan.template.sh", script)
             for filename in kit.TOOLKIT_FILES:
                 (bundle / filename).touch()
             def launch(*arguments):
@@ -277,9 +277,12 @@ class StarterKitTests(unittest.TestCase):
 
     @staticmethod
     def populate(project):
+        project.mkdir(parents=True, exist_ok=True)
+        if git := shutil.which("git"):
+            subprocess.run([git, "init", "-q", project], check=True)
         paths = ["src/main/java/example/Main.java", "pom.xml", "module/pom.xml", "mvnw", "mvnw.cmd",
                  "sidecar/build.gradle.kts", "sidecar/gradlew", "sidecar/gradlew.bat",
-                 "target/app.jar", "Dockerfile", "deploy/main.tf", ".git/Hidden.java"]
+                 "target/app.jar", "Dockerfile", "deploy/main.tf", ".cache/Hidden.java"]
         for name in paths:
             path = project / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,6 +403,7 @@ public class Main {
                     runner.assert_not_called()
                     options = kit.args_for(["--project-path", str(project), "--setup-only"])
                     self.assertEqual(kit.execute(options, system, arch), 0)
+                    self.assertFalse((project / "reports").exists())
                     runner.assert_not_called()
                     options = kit.args_for(["--project-path", str(project), "--build-image", "--details", "--verbose"])
                     self.assertEqual(kit.execute(options, system, arch), 0)
@@ -409,6 +413,8 @@ public class Main {
                                                 "syft", "syft", "grype", "grype", "checkov"])
                 application_reports = home / "reports/external-java-app"
                 reports = sorted(application_reports.iterdir())[-1]
+                for filename in kit.GENERATED_JSON:
+                    self.assertEqual((project / "reports" / filename).read_bytes(), (reports / filename).read_bytes())
                 self.assertEqual(set(p.name for p in reports.glob("*.json")),
                                  set(kit.REPORTS.values()) | {"security-summary.json", "grype-sbom-report.json"})
                 summary = json.loads((reports / "security-summary.json").read_text())
@@ -682,6 +688,57 @@ public class Main {
         self.assertEqual(kit.report_application_directory("Acme / Orders"), "acme-orders")
         self.assertEqual(kit.report_application_directory(".."), "application")
 
+    def test_report_export_rejects_a_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, outside = root / "app", root / "outside"
+            app.mkdir()
+            outside.mkdir()
+            protected = outside / "security-summary.json"
+            protected.write_text("developer file")
+            try:
+                (app / "reports").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Directory symlinks unavailable: {error}")
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(root / "home")}), \
+                 self.assertRaisesRegex(ValueError, "Project report export.*Unsafe report path"):
+                kit.execute(kit.args_for(["--project-path", str(app)]), *kit.detect())
+            self.assertEqual(protected.read_text(), "developer file")
+
+    def test_report_export_preserves_tracked_output_paths(self):
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("Git unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            reports = app / "reports"
+            reports.mkdir(parents=True)
+            protected = reports / "security-summary.json"
+            protected.write_text("tracked developer file")
+            subprocess.run([git, "init", "-q", app], check=True)
+            subprocess.run([git, "-C", app, "add", "-f", "reports/security-summary.json"], check=True)
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(root / "home")}), \
+                 self.assertRaisesRegex(ValueError, "Project report export.*tracked by Git"):
+                kit.execute(kit.args_for(["--project-path", str(app)]), *kit.detect())
+            self.assertEqual(protected.read_text(), "tracked developer file")
+
+    def test_export_failure_reports_the_private_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            app.mkdir()
+            home = root / "home"
+            options = kit.args_for(["--project-path", str(app), "--scanner", "dependency-check", "--no-install"])
+            with patch.dict(os.environ, {"ACCIDION_HOME": str(home)}), \
+                 patch.object(kit, "export_project_reports", side_effect=PermissionError("publisher denied")), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(kit.execute(options, *kit.detect()), 2)
+            self.assertFalse((app / "reports/security-summary.json").exists())
+            private = next((home / "reports").rglob("security-summary.json"))
+            self.assertIn(str(private.parent), errors.getvalue())
+            self.assertIn("Project report export failed: publisher denied", errors.getvalue())
+
     def test_failed_scanner_does_not_prevent_other_applicable_scans(self):
         with tempfile.TemporaryDirectory() as root:
             project = Path(root) / "app"
@@ -717,6 +774,9 @@ public class Main {
             self.assertEqual(summary["scanners"]["semgrep"]["findingCount"], 1)
             self.assertIn("simulated network or permission failure", summary["scanners"]["semgrep"]["reason"])
             self.assertTrue((home / "reports/app/0/semgrep-report.json").exists())
+            self.assertFalse((project / "reports/semgrep-report.json").exists())
+            self.assertFalse((project / "reports/gitleaks-report.json").exists())
+            self.assertTrue((project / "reports/grype-report.json").exists())
             self.assertEqual(summary["scanners"]["grype"]["status"], "success")
             self.assertEqual(summary["scanners"]["checkov"]["status"], "skipped")
             self.assertEqual(summary["installations"]["checkov"]["status"], "skipped")
