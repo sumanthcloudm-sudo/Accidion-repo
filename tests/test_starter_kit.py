@@ -83,6 +83,26 @@ class StarterKitTests(unittest.TestCase):
                 installer.install_archive("grype")
             fetch.assert_not_called()
 
+    def test_intel_macos_semgrep_uses_verified_wheel_and_versioned_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            installer = starter_install.Installer("macos", "amd64", cache, True, None)
+            base = cache / f"semgrep-1.182.1-{sys.version_info.major}.{sys.version_info.minor}"
+            script = base / "bin/semgrep"
+            script.parent.mkdir(parents=True)
+            script.touch()
+            with patch.object(starter_install, "run", return_value="pip 25.3") as run:
+                installer.install_pypi("semgrep")
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], base / "bin/python")
+            self.assertIn("--only-binary=:all:", command)
+            self.assertRegex(command[-1], r"^https://files\.pythonhosted\.org/.*/semgrep-1\.182\.1-"
+                                          r".*-macosx_10_14_x86_64\.whl#sha256=[0-9a-f]{64}$")
+            self.assertEqual(installer.managed("semgrep"), [str(script)])
+            for system, arch in (("macos", "arm64"), ("windows", "amd64"), ("linux", "amd64"), ("linux", "arm64")):
+                other = starter_install.Installer(system, arch, cache, True, None)
+                self.assertEqual(other.pypi_package("semgrep"), ("1.186.0", "semgrep==1.186.0"))
+
     def test_pinned_release_rejects_checksum_mismatch_without_api_request(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(starter_install, "fetch", return_value="0" * 64) as fetch:

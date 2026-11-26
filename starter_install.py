@@ -44,6 +44,14 @@ RELEASE_SHA256 = {
     "dependency-check-12.2.2-release.zip": "bf07fefd81af3094c5f6850423b014df44db62ce2dbad0f79079a90df675e44a",
 }
 PYPI = {"semgrep": "1.186.0", "checkov": "3.2.495"}
+# The 1.182 series was the last to ship Intel macOS wheels.
+SEMGREP_INTEL_MACOS = "1.182.1"
+SEMGREP_INTEL_WHEEL = (
+    "https://files.pythonhosted.org/packages/37/7e/"
+    "20dafdcb0a7d11d6a5017601a3737ea3b4bea5628711db7fddde3f5ff3de/"
+    "semgrep-1.182.1-cp310.cp311.cp312.cp313.cp314.py310.py311.py312.py313.py314-none-macosx_10_14_x86_64.whl"
+    "#sha256=1db6d5becbb60d697a312fce6ec7e00cfde4eff1d221cce7ce85c49df55240eb"
+)
 LINUX_JDK = "21.0.11+10"
 BOOTSTRAP_PIP = "25.3"
 MINIMUM = {
@@ -410,9 +418,7 @@ class Installer:
             if not self.allow:
                 detail = f" Last version check: {probe_error}" if probe_error else ""
                 raise RuntimeError(f"Missing or incompatible; installation disabled.{detail}")
-            if name == "semgrep" and (self.system, self.arch) in {
-                ("macos", "amd64"), ("windows", "arm64"),
-            }:
+            if name == "semgrep" and (self.system, self.arch) == ("windows", "arm64"):
                 raise RuntimeError(f"Semgrep {PYPI[name]} publishes no native wheel for "
                                    f"{self.system}/{self.arch}; use an approved compatible installation")
             status = "installation_failed"
@@ -435,10 +441,17 @@ class Installer:
                 self.records[name]["completedAt"] = datetime.now(timezone.utc).isoformat()
                 self.records[name]["durationSeconds"] = round(time.perf_counter() - ensure_started, 2)
 
+    def pypi_package(self, name):
+        if name == "semgrep" and (self.system, self.arch) == ("macos", "amd64"):
+            return SEMGREP_INTEL_MACOS, SEMGREP_INTEL_WHEEL
+        version = PYPI[name]
+        return version, f"{name}=={version}"
+
     def managed(self, name):
         suffix = ".exe" if self.system == "windows" else ""
         if name in PYPI:
-            base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
+            version, _ = self.pypi_package(name)
+            base = self.cache / f"{name}-{version}-{sys.version_info.major}.{sys.version_info.minor}"
             path = base / ("Scripts" if suffix else "bin") / (name + suffix)
             if name == "checkov" and not suffix:
                 interpreter = base / "bin/python"
@@ -489,7 +502,8 @@ class Installer:
         return cmd
 
     def install_pypi(self, name):
-        base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
+        version, package = self.pypi_package(name)
+        base = self.cache / f"{name}-{version}-{sys.version_info.major}.{sys.version_info.minor}"
         python = base / ("Scripts/python.exe" if self.system == "windows" else "bin/python")
         try:
             pip = run([python, "-m", "pip", "--version"], capture=True, timeout=60)
@@ -513,9 +527,9 @@ class Installer:
         self.records[f"pip:{name}"] = {"status": status, "version": pip.split()[1]}
         try:
             run([python, "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
-                 "--retries", "2", f"{name}=={PYPI[name]}"], log=self.log)
+                 "--retries", "2", package], log=self.log)
         except RuntimeError as error:
-            raise RuntimeError(f"Could not install {name} {PYPI[name]} wheels for {self.system}/{self.arch} "
+            raise RuntimeError(f"Could not install {name} {version} wheels for {self.system}/{self.arch} "
                                f"with Python {sys.version_info.major}.{sys.version_info.minor}. "
                                "Check wheel availability and the approved package index in run.log.") from error
 

@@ -122,12 +122,8 @@ jobs:
           export UV_PYTHON_INSTALL_DIR="$RUNNER_TEMP/managed python"
           cd "$RUNNER_TEMP/fresh application"
           test ! -e security-scan.properties
-          expected_exit=0
-          if [[ "$RUNNER_ARCH" == X64 ]]; then expected_exit=1; fi
           for pass in first repeat; do
-            result=0
-            PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash security-scan.sh || result=$?
-            test "$result" -eq "$expected_exit"
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash security-scan.sh
             test -s security-scan.properties
             grep -Fxq 'SCANNERS=all' security-scan.properties
             if [[ "$pass" == first ]]; then
@@ -151,12 +147,11 @@ jobs:
               assert (summary["platform"], summary["architecture"]) == ("macos", arch), summary
               assert set(summary["scanners"]) == names, summary["scanners"]
               for scanner, entry in summary["scanners"].items():
-                  if scanner == "semgrep" and arch == "amd64":
-                      assert entry["status"] == "unavailable" and "no native wheel" in entry["reason"], entry
-                      print(f"::warning title=Intel macOS Semgrep limitation::{entry['reason']}")
-                      continue
                   assert entry["status"] == "success", (scanner, entry)
                   assert entry["installationStatus"] == expected, (scanner, entry)
+                  if scanner == "semgrep":
+                      version = "1.182.1" if arch == "amd64" else "1.186.0"
+                      assert entry["version"] == version, entry
                   json.loads(Path(entry["report"]).read_text(encoding="utf-8"))
                   print(f"{scanner}: {expected}, successful, valid JSON")
           PY
