@@ -23,6 +23,7 @@ RELEASES = {
     "dependency-check": ("dependency-check/DependencyCheck", "12.2.2"),
 }
 PYPI = {"semgrep": "1.186.0", "checkov": "3.2.495"}
+LINUX_JDK = "21.0.11+10"
 BOOTSTRAP_PIP = "25.3"
 MINIMUM = {
     "git": (2, 30), "java": (11,), "mvn": (3, 6), "gradle": (7,),
@@ -126,6 +127,12 @@ def stop_process_tree(process, job):
         if process.poll() is None:
             process.kill()
     else:
+        try:
+            # Give scanner shutdown hooks a chance to release database locks.
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=3)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -358,6 +365,15 @@ class Installer:
         if name in PYPI:
             base = self.cache / f"{name}-{PYPI[name]}-{sys.version_info.major}.{sys.version_info.minor}"
             path = base / ("Scripts" if suffix else "bin") / (name + suffix)
+            if name == "checkov" and not suffix:
+                interpreter = base / "bin/python"
+                if interpreter.is_file() and path.is_file():
+                    return [str(interpreter), "-I", str(path)]
+        elif name == "java" and self.system == "linux":
+            base = self.cache / f"{name}-{LINUX_JDK}-{self.system}-{self.arch}"
+            if not (base / ".complete").is_file():
+                return None
+            path = next(base.glob("*/bin/java"), base / "missing")
         elif name in RELEASES or name in {"mvn", "gradle"}:
             base = self.cache / f"{name}-{self.release_version(name)}-{self.system}-{self.arch}"
             if not (base / ".complete").exists():
@@ -379,7 +395,7 @@ class Installer:
         if name in PYPI:
             self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.install_pypi(name)
-        elif name in RELEASES or name in {"mvn", "gradle"}:
+        elif name in RELEASES or name in {"mvn", "gradle"} or (name == "java" and self.system == "linux"):
             self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.install_archive(name)
         else:
@@ -443,8 +459,17 @@ class Installer:
                  "--no-index", "--no-deps", archive], log=self.log, timeout=120)
 
     def install_archive(self, name):
-        version = self.release_version(name)
-        if name in RELEASES:
+        version = LINUX_JDK if name == "java" else self.release_version(name)
+        if name == "java":
+            arch = {"amd64": "x64", "arm64": "aarch64"}[self.arch]
+            asset = f"OpenJDK21U-jdk_{arch}_linux_hotspot_{version.replace('+', '_')}.tar.gz"
+            url = f"https://github.com/adoptium/temurin21-binaries/releases/download/jdk-{version.replace('+', '%2B')}/{asset}"
+            algorithm = "sha256"
+            checksum = fetch(url + ".sha256.txt").decode("ascii").split()
+            if not checksum or not re.fullmatch(r"[0-9a-fA-F]{64}", checksum[0]):
+                raise RuntimeError("Invalid JDK checksum")
+            expected = checksum[0]
+        elif name in RELEASES:
             repo, _ = RELEASES[name]
             asset_name = release_asset(name, version, self.system, self.arch)
             release = json.loads(fetch(f"https://api.github.com/repos/{repo}/releases/tags/v{version}"))
