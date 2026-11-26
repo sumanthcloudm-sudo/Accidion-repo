@@ -736,7 +736,7 @@ public class Main {
                 self.assertEqual(kit.execute(options, *kit.detect()), 2)
             self.assertFalse((app / "reports/security-summary.json").exists())
             private = next((home / "reports").rglob("security-summary.json"))
-            self.assertIn(str(private.parent), errors.getvalue())
+            self.assertIn(str(private.parent.resolve()), errors.getvalue())
             self.assertIn("Project report export failed: publisher denied", errors.getvalue())
 
     def test_failed_scanner_does_not_prevent_other_applicable_scans(self):
