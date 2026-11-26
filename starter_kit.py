@@ -1274,7 +1274,7 @@ def execute_with_reports(options, system, arch, stack, *, in_memory_preview=Fals
             inventory = json.loads(Path(sbom_path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
-    counts, remediation_count, grouped = terminal_summary(
+    counts, review = terminal_summary(
         issues, terminal_metadata, project, contexts, emit, details=options.details,
         statuses=statuses, inventory=inventory, declaration_lookup=declaration_lookup,
     )
@@ -1288,13 +1288,18 @@ def execute_with_reports(options, system, arch, stack, *, in_memory_preview=Fals
     elif failed:
         validation = "incomplete coverage; " + validation
     emit(f"Security validation: {validation}")
-    emit("Severity (grouped findings, deduplicated across scanners): " + " | ".join(f"{level} {counts[level]}" for level in SEVERITIES))
+    emit("Severity (unique findings across scanners): " + " | ".join(f"{level} {counts[level]}" for level in SEVERITIES))
     if counts["UNKNOWN"]:
         emit("UNKNOWN means the scanner supplied no recognized severity. Review these findings for impact.")
     raw = sum(entry["nativeFindingCount"] or 0 for entry in statuses.values())
     emit(f"Raw findings reported: {raw}")
-    emit(f"Grouped findings across scanner sections: {grouped}")
-    emit(f"Unique remediations across scanners: {remediation_count}")
+    emit(f"Unique findings across scanners: {sum(counts.values())}")
+    emit(f"Unique dependency vulnerability findings: {review['dependency']}")
+    emit(f"Unique source findings: {review['source']}")
+    emit(f"Dependency findings with unverified package or advisory identity: {review['unverified']}")
+    emit(f"Findings reported by multiple scanners: {review['overlap']}")
+    emit(f"Unique findings with severity conflicts: {review['severity_conflicts']}")
+    emit(f"Review groups across scanners: {review['groups']}")
     if options.verbose:
         emit("\nDiagnostics")
         for name, record in installer.records.items():

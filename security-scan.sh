@@ -1278,7 +1278,7 @@ def execute_with_reports(options, system, arch, stack, *, in_memory_preview=Fals
             inventory = json.loads(Path(sbom_path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
-    counts, remediation_count, grouped = terminal_summary(
+    counts, review = terminal_summary(
         issues, terminal_metadata, project, contexts, emit, details=options.details,
         statuses=statuses, inventory=inventory, declaration_lookup=declaration_lookup,
     )
@@ -1292,13 +1292,18 @@ def execute_with_reports(options, system, arch, stack, *, in_memory_preview=Fals
     elif failed:
         validation = "incomplete coverage; " + validation
     emit(f"Security validation: {validation}")
-    emit("Severity (grouped findings, deduplicated across scanners): " + " | ".join(f"{level} {counts[level]}" for level in SEVERITIES))
+    emit("Severity (unique findings across scanners): " + " | ".join(f"{level} {counts[level]}" for level in SEVERITIES))
     if counts["UNKNOWN"]:
         emit("UNKNOWN means the scanner supplied no recognized severity. Review these findings for impact.")
     raw = sum(entry["nativeFindingCount"] or 0 for entry in statuses.values())
     emit(f"Raw findings reported: {raw}")
-    emit(f"Grouped findings across scanner sections: {grouped}")
-    emit(f"Unique remediations across scanners: {remediation_count}")
+    emit(f"Unique findings across scanners: {sum(counts.values())}")
+    emit(f"Unique dependency vulnerability findings: {review['dependency']}")
+    emit(f"Unique source findings: {review['source']}")
+    emit(f"Dependency findings with unverified package or advisory identity: {review['unverified']}")
+    emit(f"Findings reported by multiple scanners: {review['overlap']}")
+    emit(f"Unique findings with severity conflicts: {review['severity_conflicts']}")
+    emit(f"Review groups across scanners: {review['groups']}")
     if options.verbose:
         emit("\nDiagnostics")
         for name, record in installer.records.items():
@@ -2423,10 +2428,12 @@ def dependency_issues(report, project, *, terminal=False, declaration_lookup=fin
                             cve_id=identifiers(CVE, identifier) or None, affected_dependency=component,
                             installed_version=version, reference_links=references(vuln.get("references")))
             if terminal:
+                packages = {package["id"] for package in item.get("packages", [])
+                            if package.get("id", "").startswith("pkg:maven/")}
                 issue["_terminal"] = {
-                    "package": next((package["id"] for package in item.get("packages", [])
-                                     if package.get("id", "").startswith("pkg:maven/")), None),
-                    "aliases": advisory_ids(identifier, issue["reference_links"]),
+                    "package": next(iter(packages)) if len(packages) == 1 else None,
+                    "aliases": advisory_ids(identifier),
+                    "locations": list_of(item.get("filePath")),
                     "title": title,
                 }
             yield issue
@@ -2515,15 +2522,15 @@ def grype_issues(report, _project, *, terminal=False, declaration_lookup=find_ma
 
         if terminal:
             issue["_terminal"] = {
-                "package": first_text(artifact.get("purl")) or (
-                    f"pkg:maven/{group}/{artifact_id}@{installed}"
-                    if artifact.get("type") == "java-archive" and group and artifact_id and installed else None
-                ),
+                "package": first_text(artifact.get("purl")),
+                "locations": list(dict.fromkeys([
+                    *package_paths, *(item["accessPath"] for item in artifact.get("locations") or []
+                                      if first_text(item.get("accessPath")))
+                ])),
                 "title": first_text(vuln.get("title")),
                 "fix_state": first_text((vuln.get("fix") or {}).get("state")),
                 "aliases": advisory_ids(identifier, [
-                    *(entry.get("id") for entry in row.get("relatedVulnerabilities") or []),
-                    *issue["reference_links"],
+                    entry.get("id") for entry in row.get("relatedVulnerabilities") or []
                 ]),
             }
         yield issue
@@ -2589,28 +2596,52 @@ NORMALIZE = {
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 
 
-def advisory_ids(primary, evidence):
-    ids = identifiers(CVE, primary) + identifiers(GHSA, primary)
-    if len(ids) != 1:
-        return ids[:1]
-    alias_pattern = GHSA if ids[0].startswith("CVE-") else CVE
-    aliases = identifiers(alias_pattern, evidence)
-    if len(aliases) == 1:
-        ids.extend(aliases)
-    return [f"GHSA-{item[5:].lower()}" if item.startswith("GHSA-") else item for item in ids]
+def advisory_ids(primary, related=()):
+    identifier = first_text(primary)
+    if not identifier or not (CVE.fullmatch(identifier) or GHSA.fullmatch(identifier)):
+        return []
+    primary_id = identifier.upper()
+    other_pattern = GHSA if primary_id.startswith("CVE-") else CVE
+    aliases = {value.upper() for value in related if isinstance(value, str) and other_pattern.fullmatch(value)}
+    if primary_id.startswith("CVE-") and len(aliases) > 1:
+        return [primary_id]
+    return [primary_id, *sorted(aliases)]
 
 
 def terminal_package(issue, purl):
     version = issue["installed_version"]
-    if not purl or not version:
+    if not purl or not version or re.search(r"%(?![a-fA-F0-9]{2})", purl):
         return None
-    base, _, qualifiers = purl.partition("?")
-    if base.startswith("pkg:maven/"):
-        coordinate = unquote(base.removeprefix("pkg:maven/").split("@", 1)[0]).replace("/", ":")
-        variants = [part for part in qualifiers.split("&")
-                    if part.startswith("classifier=") or part.startswith("type=") and part not in {"type=jar", "type=pom"}]
-        return "maven", coordinate, version, tuple(sorted(variants))
-    return "package", purl, version, ()
+    match = re.fullmatch(r"pkg:([a-zA-Z][a-zA-Z0-9.+-]*)/([^@?#]+)@([^?#]+)(?:\?([^#]+))?", purl)
+    if not match:
+        return None
+    ecosystem, path, encoded_version, qualifiers = match.groups()
+    ecosystem = ecosystem.lower()
+    segments = tuple(unquote(segment) for segment in path.split("/"))
+    if (any(not segment or segment in {".", ".."} or "/" in segment or "\ufffd" in segment
+            for segment in segments) or unquote(encoded_version) != version):
+        return None
+    values = {}
+    for qualifier in qualifiers.split("&") if qualifiers else ():
+        key, separator, value = qualifier.partition("=")
+        key = key.lower()
+        decoded = unquote(value)
+        if not separator or not re.fullmatch(r"[a-z][a-z0-9._-]*", key) or not decoded or key in values:
+            return None
+        values[key] = decoded
+    if ecosystem == "maven":
+        if len(segments) != 2 or any(":" in segment for segment in segments):
+            return None
+        if values.get("type") == "jar":
+            del values["type"]
+        return "maven", ":".join(segments), version, tuple(f"{k}={v}" for k, v in sorted(values.items()))
+    if ecosystem in {"npm", "pypi", "nuget"}:
+        segments = tuple(segment.lower() for segment in segments)
+    if ecosystem == "pypi":
+        segments = tuple(re.sub(r"[-_.]+", "-", segment) for segment in segments)
+    identity = f"pkg:{ecosystem}/" + "/".join(quote(segment, safe="") for segment in segments)
+    suffix = "&".join(f"{key}={quote(value, safe='')}" for key, value in sorted(values.items()))
+    return "package", f"{identity}@{quote(version, safe='')}" + (f"?{suffix}" if suffix else ""), version, ()
 
 
 def terminal_severity(issue):
@@ -2623,54 +2654,46 @@ def terminal_severity(issue):
 def terminal_groups(issues, metadata):
     packages = defaultdict(list)
     sources = defaultdict(list)
-    identities = [terminal_package(issue, evidence.get("package"))
-                  for issue, evidence in zip(issues, metadata)]
-    maven = defaultdict(set)
-    for package in identities:
-        if package and package[0] == "maven":
-            maven[package[1:3]].add(package)
-    for index, (issue, evidence, package) in enumerate(zip(issues, metadata, identities)):
-        component = issue["affected_dependency"]
-        version = issue["installed_version"]
-        if not package and component:
-            candidates = maven[component, version] if issue["scanner_name"] == "Semgrep" else set()
-            if len(candidates) == 1:
-                package = next(iter(candidates))
-            else:
-                # Group similar remediation while keeping each unverified package match as evidence.
-                package = ("reported", component, version, issue.get("scan_target"), issue["scanner_name"])
-        aliases = set(evidence.get("aliases", ()))
-        if package and issue["scanner_name"] == "Semgrep":
-            aliases.update(issue["cve_id"] or [])
-        if package:
-            packages[package].append((issue, aliases))
+    for index, (issue, evidence) in enumerate(zip(issues, metadata)):
+        if issue["scanner_name"] in {NAMES["dependency-check"], NAMES["grype"]}:
+            package = terminal_package(issue, evidence.get("package"))
+            if not package:
+                package = ("reported", issue["affected_dependency"] or "Unknown package",
+                           issue["installed_version"], issue.get("scan_target"), issue["scanner_name"])
+            packages[package].append((issue, evidence.get("aliases", ())))
         else:
             path = issue["relative_file_path"] or issue["source_file"]
             rule = issue["rule_id"] or issue["issue_name"]
             start, end = issue["start_line"], issue["end_line"]
             location_key = (path, start, end or start) if path and rule and start else index
-            key = (issue["scanner_name"], rule, location_key)
-            sources[key].append(issue)
+            sources[issue["scanner_name"], rule, location_key].append(issue)
 
     groups = [(None, [(rows, set())]) for rows in sources.values()]
+    for package, rows in packages.items():
+        # Accept a GHSA-to-CVE edge only when all structured evidence for that
+        # package version agrees. Shared CVEs can link multiple GHSAs.
+        cves_by_ghsa = defaultdict(set)
+        for _, aliases in rows:
+            if aliases and aliases[0].startswith("GHSA-"):
+                cves_by_ghsa[aliases[0]].update(aliases[1:])
+            elif len(aliases) == 2:
+                cves_by_ghsa[aliases[1]].add(aliases[0])
+        clusters = {}
+        for index, (issue, aliases) in enumerate(rows):
+            primary = aliases[0] if aliases else None
+            key = primary if primary and package[0] != "reported" else index
+            if isinstance(key, str) and len(cves_by_ghsa.get(key, ())) == 1:
+                key = next(iter(cves_by_ghsa[key]))
+            evidence, ids = clusters.setdefault(key, ([], set()))
+            evidence.append(issue)
+            if primary:
+                ids.add(primary)
+            if isinstance(key, str):
+                ids.add(key)
+        groups.append((package, list(clusters.values())))
 
     def rank(finding):
         return min(SEVERITIES.index(terminal_severity(issue)) for issue in finding[0])
-
-    for package, rows in packages.items():
-        # Index by advisory and merge overlapping clusters, even when a bridge arrives late.
-        findings = {}
-        owners = {}
-        for index, (issue, aliases) in enumerate(rows):
-            evidence = [issue]
-            for previous in sorted({owners[alias] for alias in aliases if alias in owners
-                                    and package[0] != "reported"}):
-                merged, previous_aliases = findings.pop(previous)
-                evidence.extend(merged)
-                aliases.update(previous_aliases)
-            findings[index] = (evidence, aliases)
-            owners.update(dict.fromkeys(aliases, index))
-        groups.append((package, list(findings.values())))
 
     for _, findings in groups:
         findings.sort(key=rank)
@@ -3052,14 +3075,21 @@ def terminal_evidence(findings, emit, metadata):
         if aliases:
             emit(f"  Advisory: {', '.join(sorted(aliases))}")
         for issue in sorted(evidence, key=lambda row: row["issue_number"] or 0):
+            if review := metadata[id(issue)].get("review"):
+                emit(f"    Finding review: {review}")
             target = f" / {issue['scan_target']}" if issue.get("scan_target") else ""
             emit(f"    Report finding #{issue['issue_number']} | {issue['scanner_name']}{target} | "
                  f"{issue['severity']} | {issue['rule_id'] or 'rule unavailable'}")
-            path = issue["relative_file_path"] or issue["affected_filename"]
+            path = issue["relative_file_path"] or issue["source_file"] or issue["affected_filename"]
             if path:
                 emit(f"      Source file: {path}")
                 if issue["start_line"]:
                     emit(f"      Line number(s): {source_label('', issue['start_line'], issue['end_line'])[1:]}")
+            for path in metadata[id(issue)].get("locations", ()):
+                if path:
+                    emit(f"      Scanner location: {path}")
+            for chain in issue["dependency_chains"] or []:
+                emit(f"      Dependency chain: {chain}")
             extra_ids = sorted(set(issue["cve_id"] or []) - aliases - {issue["rule_id"]})
             if extra_ids:
                 emit(f"      Related advisories: {', '.join(extra_ids)}")
@@ -3127,7 +3157,7 @@ def terminal_issue(number, scanner, package, findings, project, contexts, emit, 
     aliases = {alias for _, ids in findings for alias in ids}
     aliases.update(alias for row in rows for alias in row["cve_id"] or [])
     identifiers = sorted(aliases) or sorted({row["rule_id"] for row in rows if row["rule_id"]})
-    emit(f"\nIssue {number}")
+    emit(f"\nReview group {number}")
     terminal_field(emit, "Issue name", title)
     terminal_field(emit, "Scanner", scanner)
     terminal_field(emit, "Severity", severity)
@@ -3178,11 +3208,29 @@ def terminal_issue(number, scanner, package, findings, project, contexts, emit, 
 def terminal_summary(issues, metadata, project, contexts, emit, *,
                      details=False, statuses=None, inventory=None, declaration_lookup=find_maven_declaration):
     unique_groups, counts = terminal_groups(issues, metadata)
-    evidence_by_issue = {id(issue): row for issue, row in zip(issues, metadata)}
+    evidence_by_issue = {id(issue): dict(row) for issue, row in zip(issues, metadata)}
+    review = Counter(groups=len(unique_groups))
+    for package, findings in unique_groups:
+        review["dependency" if package else "source"] += len(findings)
+        for rows, aliases in findings:
+            if package and (package[0] == "reported" or not aliases):
+                review["unverified"] += 1
+            scanners = {row["scanner_name"] for row in rows}
+            severities = {terminal_severity(row) for row in rows} - {"UNKNOWN"}
+            conflict = len(severities) > 1
+            overlap = len(scanners) > 1
+            review["severity_conflicts"] += conflict
+            review["overlap"] += overlap
+            if overlap or conflict:
+                reported = sorted({f"{row['scanner_name']} {row['severity']}" for row in rows})
+                advisory = ", ".join(sorted(aliases))
+                label = "Severity conflict" if conflict else "Corroborated finding"
+                description = " | ".join(filter(None, (label, advisory, ", ".join(reported))))
+                for row in rows:
+                    evidence_by_issue[id(row)]["review"] = description
     by_scanner = defaultdict(list)
     for issue, evidence in zip(issues, metadata):
         by_scanner[issue["scanner_name"]].append((issue, evidence))
-    grouped_total = 0
     for key, title in SCANNER_SECTIONS:
         label = NAMES.get(key, "Syft")
         heading = f"=== {label} - {title} ==="
@@ -3202,16 +3250,15 @@ def terminal_summary(issues, metadata, project, contexts, emit, *,
         findings, evidence = zip(*rows) if rows else ((), ())
         groups, scanner_counts = terminal_groups(findings, evidence)
         grouped = sum(scanner_counts.values())
-        grouped_total += grouped
         native = entry["nativeFindingCount"] if entry is not None else len(rows)
         terminal_field(emit, "Raw findings", native if native is not None else "Unavailable")
         if native is not None or groups:
-            terminal_field(emit, "Grouped findings", grouped)
-            terminal_field(emit, "Issues to review", len(groups))
+            terminal_field(emit, "Unique findings in this scanner", grouped)
+            terminal_field(emit, "Review groups in this scanner", len(groups))
         for number, (package, findings) in enumerate(groups, 1):
             terminal_issue(number, label, package, findings, project, contexts, emit, details, evidence_by_issue,
                            declaration_lookup)
-    return counts, len(unique_groups), grouped_total
+    return counts, review
 ACCIDION_f84ead745374f4fa8f5979cf3c03ce3032bcad71ca080ca8284da0bc22a72687
   command cat > "$1/python-bootstrap.sh" <<'ACCIDION_044e7a0c6ae1ea7f7a198755873d091bacaa5447b3445b42c35c011cfccc25f2'
 #!/usr/bin/env bash

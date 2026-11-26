@@ -471,7 +471,7 @@ public class Main {
                 self.assertRegex(output, r"Started \(UTC\) +\d{4}-\d{2}-\d{2}")
                 self.assertRegex(output, r"Applicable scanners +Gitleaks, Semgrep, OWASP Dependency-Check, Syft, Grype, Checkov")
                 self.assertLess(output.index("=== Accidion Security Scan ==="), output.index("Gitleaks: running"))
-                self.assertIn("Severity (grouped findings, deduplicated across scanners):", output)
+                self.assertIn("Severity (unique findings across scanners):", output)
                 self.assertIn("Scanning in progress", output)
                 self.assertRegex(output, r"(?m)^  library +maven +1$")
                 self.assertRegex(output, r"Component examples +test 1\.0")
@@ -484,7 +484,7 @@ public class Main {
                 ends = headings[1:] + [output.index("=== Security Summary ===", headings[-1])]
                 sections = [output[start:end] for start, end in zip(headings, ends)]
                 for section, expected in zip(sections, ([1, 2, 3, 4, 5, 6], [1], [1], [], [1, 2], [1])):
-                    self.assertEqual([int(n) for n in re.findall(r"(?m)^Issue (\d+)$", section)], expected)
+                    self.assertEqual([int(n) for n in re.findall(r"(?m)^Review group (\d+)$", section)], expected)
                 self.assertIn("Diagnostics", output)
                 self.assertLess(output.index("Semgrep: running"), output.index("Semgrep: success"))
                 original = json.loads((reports / "gitleaks-report.json").read_text())
@@ -823,13 +823,13 @@ public class Main {
             for index, row in enumerate(rows, 1):
                 row["issue_number"] = index
             groups, counts = findings.terminal_groups(rows, metadata)
-            self.assertEqual(len(groups), 4)
-            self.assertEqual(counts, {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 1, "LOW": 1})
+            self.assertEqual(len(groups), 5)
+            self.assertEqual(counts, {"CRITICAL": 1, "HIGH": 3, "MEDIUM": 1, "LOW": 1})
             self.assertEqual(sum(len(evidence) for _, group in groups for evidence, _ in group), 7)
-            self.assertEqual(groups[0][1][0][1], {cve, ghsa})
+            self.assertEqual(groups[0][1][0][1], {cve, ghsa.upper()})
             output = []
-            _, unique, grouped = findings.terminal_summary(rows, metadata, project, {}, output.append)
-            self.assertEqual((unique, grouped), (4, 6))
+            severity, review = findings.terminal_summary(rows, metadata, project, {}, output.append)
+            self.assertEqual((sum(severity.values()), review["groups"], review["overlap"]), (6, 5, 1))
             rendered = "\n".join(output)
             self.assertRegex(rendered, r"Source file +pom\.xml")
             self.assertRegex(rendered, r"Line number\(s\) +3-5")
@@ -840,15 +840,15 @@ public class Main {
             self.assertIn("Confirm the resolved version against each advisory", rendered)
             self.assertNotIn("Related issue", rendered)
             owasp, grype = rendered.split("=== Grype - Package Vulnerability Scanning ===")
-            self.assertRegex(owasp, r"(?m)^Issue 1$")
-            self.assertRegex(grype, r"(?m)^Issue 1$")
+            self.assertRegex(owasp, r"(?m)^Review group 1$")
+            self.assertRegex(grype, r"(?m)^Review group 1$")
             self.assertRegex(grype, r"Scanner +Grype")
             self.assertEqual(rendered.count("Issue name          Vulnerable package: example:library\n"), 3)
             output.clear()
             findings.terminal_summary(rows, metadata, project, {}, output.append, details=True)
             detail = "\n".join(output)
             self.assertIn(cve, detail)
-            self.assertIn(ghsa, detail)
+            self.assertIn(ghsa.upper(), detail)
             self.assertIn("Reported fixed versions: 1.2", detail)
             self.assertIn("Reported fixed versions: 2.0", detail)
             self.assertNotIn("/temporary/", rendered)
@@ -930,7 +930,7 @@ public class Main {
             output = []
             findings.terminal_summary(rows, metadata, project, {}, output.append)
             rendered = "\n".join(output)
-            self.assertEqual(rendered.count("Issue name          Vulnerable package: example:library-0"), 2)
+            self.assertEqual(rendered.count("Issue name          Vulnerable package: example:library-0"), 1)
             self.assertEqual(rendered.count("Hardcoded authentication token"), 2)
             self.assertRegex(rendered, r"Source file +App\.java")
             self.assertRegex(rendered, r"(?m)Line number\(s\) +5$")
@@ -943,7 +943,7 @@ public class Main {
             self.assertIn("CVE-2025-11111", rendered)
             output.clear()
             findings.terminal_summary(rows, metadata, project, {}, output.append, details=True)
-            self.assertIn("Advisory: CVE-2025-11111", "\n".join(output))
+            self.assertIn("Related advisories: CVE-2025-11111", "\n".join(output))
 
     def test_technology_specific_issue_guidance(self):
         rows = [
@@ -984,18 +984,18 @@ public class Main {
                 metadata.append({"package": f"pkg:maven/example/lib-{number}@1",
                                  "aliases": [f"CVE-2025-1000{number}"]} if dependency else {})
         output = []
-        _, unique, grouped = findings.terminal_summary(
+        severity, review = findings.terminal_summary(
             rows, metadata, Path.cwd(), {}, output.append, details=True)
-        self.assertEqual((unique, grouped), (8, 10))
+        self.assertEqual((sum(severity.values()), review["groups"], review["overlap"]), (8, 8, 2))
         rendered = "\n".join(output)
         for key, title in findings.SCANNER_SECTIONS:
             if key == "syft":
                 continue
             label = kit.NAMES[key]
             section = rendered.split(f"=== {label} - {title} ===", 1)[1].split("===", 1)[0]
-            self.assertEqual(re.findall(r"(?m)^Issue (\d+)$", section), ["1", "2"])
+            self.assertEqual(re.findall(r"(?m)^Review group (\d+)$", section), ["1", "2"])
             self.assertRegex(section, r"Raw findings +3")
-            self.assertRegex(section, r"Grouped findings +2")
+            self.assertRegex(section, r"Unique findings in this scanner +2")
             self.assertEqual(section.count("Report finding #"), 3)
             self.assertRegex(section, rf"Scanner +{re.escape(label)}")
         self.assertNotIn("Related issue", rendered)
