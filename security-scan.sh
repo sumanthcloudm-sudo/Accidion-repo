@@ -450,6 +450,8 @@ def native_finding_count(name, report):
 
 
 def report_error(name, report):
+    if name == "dependency-check" and report.get("scanInfo", {}).get("analysisExceptions"):
+        return "Dependency-Check analysis exceptions; scan coverage is incomplete."
     if name == "semgrep" and report.get("errors"):
         return "Semgrep reported scan errors. See the individual report."
     if name == "checkov" and any(scan["summary"].get("parsing_errors")
@@ -1316,6 +1318,8 @@ def execute_with_reports(options, system, arch, stack, *, in_memory_preview=Fals
             if problems and entry["nativeFindingCount"] == 0:
                 entry["nativeFindingCount"] = None
                 entry["findingCount"] = None
+            if name == "dependency-check":
+                entry["coverageComplete"] = not problems
             entry.update(status="failed" if problems else "success",
                          reason=redactor.text("; ".join(problems)) if problems else None)
             entry["completedAt"] = datetime.now(timezone.utc).isoformat()
@@ -1327,10 +1331,11 @@ def execute_with_reports(options, system, arch, stack, *, in_memory_preview=Fals
                 print(f"{label}: {entry['reason']}", file=log)
             log.flush()
 
-        def invoke(cmd, *args, accepted=(0,), env=None):
+        def invoke(cmd, *args, accepted=(0,), env=None, command_timeout=None):
             print(f"\n--- {Path(cmd[0]).name} ---", file=log, flush=True)
             scanner_env = {**os.environ, **(env if env is not None else installer.scratch_env)}
-            run([*cmd, *args], cwd=project, log=log, accepted=accepted, env=scanner_env, timeout=timeout)
+            run([*cmd, *args], cwd=project, log=log, accepted=accepted, env=scanner_env,
+                timeout=timeout if command_timeout is None else command_timeout)
 
         with tempfile.TemporaryDirectory(prefix="work-", dir=report_dir) as directory:
             work = Path(directory)
@@ -1400,19 +1405,25 @@ def execute_with_reports(options, system, arch, stack, *, in_memory_preview=Fals
                 if nvd_mirror:
                     diagnostics.append("OWASP Dependency-Check uses a configured NVD JSON 2.0 feed")
                     args.extend(("--nvdDatafeed", nvd_mirror))
+                command_timeout = int(os.getenv("ACCIDION_DEPENDENCY_CHECK_TIMEOUT", "900"))
+                if command_timeout < 1:
+                    raise ValueError("ACCIDION_DEPENDENCY_CHECK_TIMEOUT must be positive")
+                properties = work / "dependency-check.properties"
+                settings = ["connection.timeout=10000", "connection.read.timeout=20000",
+                            "analyzer.central.retry.count=2", "nvd.api.max.retry.count=3"]
                 if key := os.getenv("NVD_API_KEY"):
                     if not re.fullmatch(r"[a-zA-Z0-9-]+", key):
                         raise ValueError("NVD_API_KEY contains unexpected characters")
                     redactor.add([key])
-                    properties = work / "dependency-check.properties"
-                    properties.write_text(f"nvd.api.key={key}\n", encoding="ascii")
-                    args.extend(("--propertyfile", properties))
+                    settings.append(f"nvd.api.key={key}")
+                properties.write_text("\n".join(settings) + "\n", encoding="ascii")
+                args.extend(("--propertyfile", properties))
                 diagnostic("OWASP Dependency-Check: starting database update and dependency analysis...")
                 command_started = time.perf_counter()
                 if recover_dependency_check_lock(database):
                     print("Dependency-Check | Removed an orphaned update lock before scanning", file=log)
                 try:
-                    invoke(cmd, *args)
+                    invoke(cmd, *args, command_timeout=command_timeout)
                 except (CommandTimeout, KeyboardInterrupt):
                     if recover_dependency_check_lock(database, wait_for_release=True):
                         print("Dependency-Check | Removed an orphaned update lock after scanning", file=log)
